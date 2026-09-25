@@ -902,7 +902,12 @@ def _update_context_from(job: Dict[str, Any], a: Dict[str, Any], updates: Dict[s
 
 
 def _update_run_fields(job: Dict[str, Any], a: Dict[str, Any], updates: Dict[str, Any]) -> Optional[str]:
-    """enabled_toolsets / attach_to_session / workdir / no_agent / repeat / schedule."""
+    """enabled_toolsets / attach_to_session / workdir / no_agent / repeat / schedule.
+
+    Schedule edits historically re-armed every non-``paused`` job.  Keep that
+    default for compatibility, but let callers explicitly update a disabled
+    job's schedule without changing its lifecycle state.
+    """
     if a["enabled_toolsets"] is not None:
         # [] is an explicit zero-tool allowlist, not a clear back to the unrestricted default (#82010).
         updates["enabled_toolsets"] = a["enabled_toolsets"]
@@ -929,7 +934,7 @@ def _update_run_fields(job: Dict[str, Any], a: Dict[str, Any], updates: Dict[str
         parsed_schedule = parse_schedule(a["schedule"])
         updates["schedule"] = parsed_schedule
         updates["schedule_display"] = parsed_schedule.get("display", a["schedule"])
-        if job.get("state") != "paused":
+        if not a.get("preserve_lifecycle", False) and job.get("state") != "paused":
             updates["state"] = "scheduled"
             updates["enabled"] = True
     return None
@@ -1014,7 +1019,8 @@ def cronjob(
     paused: bool = False,
     paused_reason: Optional[str] = None,
     pinned: Optional[bool] = None,
-    interpreter: Optional[str] = None) -> str:
+    interpreter: Optional[str] = None,
+    preserve_lifecycle: bool = False) -> str:
     """Unified cron job management tool."""
     a = dict(locals())
     del a["task_id"]  # unused but kept for handler signature compatibility
@@ -1065,6 +1071,10 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
         "properties": {
             "paused": {"type": "boolean", "description": "Create only: persist disabled atomically. Resume to schedule; explicit run remains available. Default false."},
             "paused_reason": {"type": "string", "description": "Create only: auditable reason; requires paused=true."},
+            "preserve_lifecycle": {
+                "type": "boolean",
+                "description": "Update only: when changing `schedule`, preserve the job's existing `enabled` and `state` instead of re-arming it. Use this when correcting schedule drift on a disabled or paused job. Default false for backwards compatibility."
+            },
             "action": {
                 "type": "string",
                 "description": "One of: create, list, update, pause, resume, remove, run. When action=create, the 'schedule' and 'prompt' fields are REQUIRED."
@@ -1170,7 +1180,7 @@ def check_cronjob_requirements() -> bool:
 _HANDLER_FORWARDED_ARGS = (
     "job_id", "prompt", "schedule", "name", "repeat", "deliver", "failure_deliver", "skill", "skills", "reason",
     "script", "context_from", "continuity", "enabled_toolsets", "workdir", "no_agent", "attach_to_session",
-    "paused_reason", "pinned")
+    "paused_reason", "preserve_lifecycle", "pinned")
 
 
 def _cronjob_handler(args, **kw):
