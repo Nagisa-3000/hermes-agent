@@ -1510,9 +1510,12 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
     def get_messages_as_conversation(self, session_id: str, include_ancestors: bool = False,
                                      include_inactive: bool = False, repair_alternation: bool = False,
                                      include_row_ids: bool = False,
-                                     include_compacted: bool = False) -> list[dict[str, Any]]:
+                                     include_compacted: bool = False,
+                                     include_summary_markers: bool = False) -> list[dict[str, Any]]:
         """Load messages in OpenAI format. ``include_compacted`` (deduped display history) is for DISPLAY reads
-        only: the model-fed restore must not regrow what compaction summarized away. ``repair_alternation``
+        only: the model-fed restore must not regrow what compaction summarized away.
+        ``include_summary_markers`` preserves synthetic compaction rows for audit/re-derivation callers.
+        ``repair_alternation``
         repairs the loaded list for LIVE REPLAY callers (a durable ``user;user`` pair would re-trigger the
         per-request repair forever), preserving summary markers before repair so derivative context
         cannot merge with an original user turn; the stored transcript is never mutated."""
@@ -1524,7 +1527,7 @@ class SessionMessagesMixin(SessionDetachedResultsMixin, SessionTodoResultMixin):
             rows = self._dedupe_display_generations(rows, drop_removed=display)
         return self._rows_to_conversation(rows, session_id=session_id, include_ancestors=include_ancestors,
             repair_alternation=repair_alternation, include_row_ids=include_row_ids,
-            include_summary_markers=repair_alternation)
+            include_summary_markers=include_summary_markers or repair_alternation)
 
     def conversation_revision(self, session_id: str, include_ancestors: bool = False) -> tuple:
         """A cheap fingerprint of what ``get_messages_as_conversation`` (live rows) would load: the
