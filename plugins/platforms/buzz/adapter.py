@@ -506,6 +506,10 @@ _ATTACHMENT_KIND_TYPES = {"image": MessageType.PHOTO, "video": MessageType.VIDEO
 class BuzzAdapter(BasePlatformAdapter):
     """Buzz adapter (WebSocket push with poll fallback) for the BasePlatformAdapter interface."""
 
+    # The relay edit is the durable stream finalization; always emit an explicit
+    # cursor-free final edit after the last preview frame.
+    REQUIRES_EDIT_FINALIZE = True
+
     def __init__(self, config, **kwargs):
         super().__init__(config=config, platform=Platform("buzz"))
         extra = getattr(config, "extra", {}) or {}

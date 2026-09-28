@@ -3180,6 +3180,9 @@ class TestStandaloneSend:
 # ── Editing and deleting (streaming) ──────────────────────────────────
 
 class TestBuzzAdapterEdit:
+    def test_stream_finalization_requires_an_explicit_edit(self):
+        assert BuzzAdapter.REQUIRES_EDIT_FINALIZE is True
+
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("content", ["partial answer\nGrüezi 🌍\n", "--status\n- checking progress"])
