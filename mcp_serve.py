@@ -1,14 +1,16 @@
 """
 Hermes MCP Server — expose messaging conversations as MCP tools (`hermes mcp serve`).
 
-A stdio MCP server letting any MCP client (Claude Code, Cursor, Codex, ...) list
-conversations, read history, send messages, poll live events, and manage approvals.
-Matches OpenClaw's 9-tool channel bridge surface plus the Hermes-specific
-channels_list. Client config: {"mcpServers": {"hermes": {"command": "hermes", "args": ["mcp", "serve"]}}}
+A stdio or Streamable HTTP MCP server letting MCP clients list conversations,
+read history, send messages, poll live events, and manage approvals. Matches
+OpenClaw's 9-tool channel bridge surface plus the Hermes-specific channels_list.
+Stdio client config: {"mcpServers": {"hermes": {"command": "hermes", "args": ["mcp", "serve"]}}}
 """
 
 from __future__ import annotations
 
+import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -23,9 +25,53 @@ from typing import Dict, List, Optional
 
 logger = logging.getLogger("hermes.mcp_serve")
 
+
+@dataclass(frozen=True)
+class _StreamableHTTPOptions:
+    host: str
+    port: int
+    path: str
+    auth_token: Optional[str]
+    ssl_certfile: Optional[str]
+    ssl_keyfile: Optional[str]
+
+
+class _BearerTokenApp:
+    """Small ASGI bearer-token gate for the Streamable HTTP endpoint."""
+
+    def __init__(self, app, token: str):
+        self._app = app
+        self._expected = f"Bearer {token}".encode("utf-8")
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self._app(scope, receive, send)
+            return
+
+        provided = next(
+            (value for name, value in scope.get("headers", ()) if name.lower() == b"authorization"),
+            b"",
+        )
+        if hmac.compare_digest(provided, self._expected):
+            await self._app(scope, receive, send)
+            return
+
+        body = b'{"error":"unauthorized"}'
+        await send({
+            "type": "http.response.start",
+            "status": 401,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode("ascii")),
+                (b"www-authenticate", b"Bearer"),
+            ],
+        })
+        await send({"type": "http.response.body", "body": body})
+
+
 # mcp 2.0 removed `mcp.server.fastmcp`; `mcp.server.MCPServer` keeps the same
-# `@server.tool()` / `run_stdio_async()` surface (docstring -> description,
-# signature -> input schema).
+# `@server.tool()` surface and stdio / Streamable HTTP runners (docstring ->
+# description, signature -> input schema).
 _MCP_SERVER_AVAILABLE = False
 try:
     from mcp.server import MCPServer
@@ -704,12 +750,127 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "MCPServer"
     return mcp
 
 
-def run_mcp_server(verbose: bool = False) -> None:
-    """Start the Hermes MCP server on stdio."""
+def _loopback_host(host: str) -> bool:
+    if host.strip().lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host.strip()).is_loopback
+    except ValueError:
+        return False
+
+
+def _streamable_http_options(
+    *,
+    host: str,
+    port: int,
+    path: str,
+    auth_token_env: str,
+    allow_unauthenticated: bool,
+    ssl_certfile: Optional[str],
+    ssl_keyfile: Optional[str],
+) -> _StreamableHTTPOptions:
+    host = host.strip()
+    if not host:
+        raise ValueError("--host must not be empty")
+    if not isinstance(port, int) or not 1 <= port <= 65535:
+        raise ValueError("--port must be between 1 and 65535")
+
+    path = path.strip()
+    if not path.startswith("/") or path.startswith("//") or "?" in path or "#" in path:
+        raise ValueError("--path must be an absolute URL path such as /mcp")
+
+    auth_token_env = (auth_token_env or "").strip()
+    if not auth_token_env:
+        raise ValueError("--auth-token-env must name an environment variable")
+    auth_token = os.environ.get(auth_token_env) or None
+    if not _loopback_host(host) and auth_token is None and not allow_unauthenticated:
+        raise ValueError(
+            f"remote bind {host!r} requires bearer authentication; set {auth_token_env} "
+            "or pass --allow-unauthenticated"
+        )
+
+    if bool(ssl_certfile) != bool(ssl_keyfile):
+        raise ValueError("--ssl-certfile and --ssl-keyfile must be provided together")
+    expanded_cert = str(Path(ssl_certfile).expanduser()) if ssl_certfile else None
+    expanded_key = str(Path(ssl_keyfile).expanduser()) if ssl_keyfile else None
+    for option, value in (("--ssl-certfile", expanded_cert), ("--ssl-keyfile", expanded_key)):
+        if value and not Path(value).is_file():
+            raise ValueError(f"{option} does not exist or is not a file: {value}")
+
+    return _StreamableHTTPOptions(
+        host=host,
+        port=port,
+        path=path,
+        auth_token=auth_token,
+        ssl_certfile=expanded_cert,
+        ssl_keyfile=expanded_key,
+    )
+
+
+async def _run_streamable_http_server(
+    server: "MCPServer",
+    options: _StreamableHTTPOptions,
+    *,
+    verbose: bool,
+) -> None:
+    import uvicorn
+
+    app = server.streamable_http_app(
+        streamable_http_path=options.path,
+        host=options.host,
+    )
+    if options.auth_token:
+        app = _BearerTokenApp(app, options.auth_token)
+
+    config = uvicorn.Config(
+        app,
+        host=options.host,
+        port=options.port,
+        log_level="debug" if verbose else "warning",
+        lifespan="on",
+        ssl_certfile=options.ssl_certfile,
+        ssl_keyfile=options.ssl_keyfile,
+    )
+    await uvicorn.Server(config).serve()
+
+
+def run_mcp_server(
+    verbose: bool = False,
+    *,
+    transport: str = "stdio",
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    path: str = "/mcp",
+    auth_token_env: str = "HERMES_MCP_AUTH_TOKEN",
+    allow_unauthenticated: bool = False,
+    ssl_certfile: Optional[str] = None,
+    ssl_keyfile: Optional[str] = None,
+) -> None:
+    """Start the Hermes MCP server over stdio or Streamable HTTP."""
     if not _MCP_SERVER_AVAILABLE:
         print("Error: MCP server requires the 'mcp' package.\n"
               f"Install with: {sys.executable} -m pip install 'mcp'", file=sys.stderr)
         sys.exit(1)
+
+    http_options = None
+    if transport == "streamable-http":
+        try:
+            http_options = _streamable_http_options(
+                host=host,
+                port=port,
+                path=path,
+                auth_token_env=auth_token_env,
+                allow_unauthenticated=allow_unauthenticated,
+                ssl_certfile=ssl_certfile,
+                ssl_keyfile=ssl_keyfile,
+            )
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            raise SystemExit(2) from None
+    elif transport != "stdio":
+        print(f"Error: unsupported MCP server transport: {transport}", file=sys.stderr)
+        raise SystemExit(2)
+
     logging.basicConfig(level=logging.DEBUG if verbose else logging.WARNING, stream=sys.stderr)
     bridge = EventBridge()
     bridge.start()
@@ -718,11 +879,21 @@ def run_mcp_server(verbose: bool = False) -> None:
 
     async def _run():
         try:
-            await server.run_stdio_async()
+            if http_options is None:
+                await server.run_stdio_async()
+            else:
+                scheme = "https" if http_options.ssl_certfile else "http"
+                auth = " with bearer authentication" if http_options.auth_token else ""
+                print(
+                    f"Hermes MCP server binding to {scheme}://{http_options.host}:"
+                    f"{http_options.port}{http_options.path}{auth}",
+                    file=sys.stderr,
+                )
+                await _run_streamable_http_server(server, http_options, verbose=verbose)
         finally:
             bridge.stop()
 
     try:
         asyncio.run(_run())
     except KeyboardInterrupt:
-        bridge.stop()
+        pass

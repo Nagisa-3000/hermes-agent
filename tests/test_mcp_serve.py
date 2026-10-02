@@ -12,9 +12,14 @@ import asyncio
 import inspect
 import json
 import os
+import socket
 import sqlite3
+import subprocess
+import sys
 import time
 import threading
+import urllib.error
+import urllib.request
 from unittest.mock import MagicMock
 
 import pytest
@@ -907,6 +912,184 @@ class TestRunMcpServer:
             mcp_serve.run_mcp_server()
         assert exc_info.value.code == 1
 
+    def test_streamable_http_uses_http_runner(self, monkeypatch):
+        import mcp_serve
+
+        calls = []
+
+        class Bridge:
+            def start(self):
+                calls.append("start")
+
+            def stop(self):
+                calls.append("stop")
+
+        server = object()
+
+        async def run_http(actual_server, options, *, verbose):
+            calls.append((actual_server, options, verbose))
+
+        monkeypatch.setattr(mcp_serve, "_MCP_SERVER_AVAILABLE", True)
+        monkeypatch.setattr(mcp_serve, "EventBridge", Bridge)
+        monkeypatch.setattr(mcp_serve, "create_mcp_server", lambda *, event_bridge: server)
+        monkeypatch.setattr(mcp_serve, "_run_streamable_http_server", run_http)
+        monkeypatch.setenv("MCP_TEST_TOKEN", "secret-token")
+
+        mcp_serve.run_mcp_server(
+            verbose=True,
+            transport="streamable-http",
+            host="0.0.0.0",
+            port=9123,
+            path="/bridge",
+            auth_token_env="MCP_TEST_TOKEN",
+            ssl_certfile=None,
+            ssl_keyfile=None,
+        )
+
+        assert calls[0] == "start"
+        actual_server, options, verbose = calls[1]
+        assert actual_server is server
+        assert verbose is True
+        assert options.host == "0.0.0.0"
+        assert options.port == 9123
+        assert options.path == "/bridge"
+        assert options.auth_token == "secret-token"
+        assert calls[2] == "stop"
+
+    def test_remote_http_bind_requires_authentication(self, monkeypatch):
+        import mcp_serve
+
+        monkeypatch.setattr(mcp_serve, "_MCP_SERVER_AVAILABLE", True)
+        monkeypatch.delenv("HERMES_MCP_AUTH_TOKEN", raising=False)
+
+        with pytest.raises(SystemExit) as exc_info:
+            mcp_serve.run_mcp_server(
+                transport="streamable-http",
+                host="0.0.0.0",
+            )
+
+        assert exc_info.value.code == 2
+
+    def test_live_streamable_http_serves_tools_with_bearer_token(self, tmp_path):
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+
+        token = "integration-secret"
+        env = os.environ.copy()
+        env["HERMES_HOME"] = str(tmp_path)
+        env["MCP_TEST_TOKEN"] = token
+        script = (
+            "from mcp_serve import run_mcp_server; "
+            f"run_mcp_server(transport='streamable-http', host='127.0.0.1', port={port}, "
+            "auth_token_env='MCP_TEST_TOKEN')"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", script],
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            for _ in range(200):
+                if proc.poll() is not None:
+                    pytest.fail(f"MCP HTTP server exited early: {proc.stderr.read()}")
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                        break
+                except OSError:
+                    time.sleep(0.05)
+            else:
+                pytest.fail("MCP HTTP server did not bind")
+
+            url = f"http://127.0.0.1:{port}/mcp"
+            request = urllib.request.Request(
+                url,
+                data=b"{}",
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with pytest.raises(urllib.error.HTTPError) as unauthorized:
+                urllib.request.urlopen(request, timeout=2)
+            assert unauthorized.value.code == 401
+
+            async def list_tools():
+                import httpx2
+
+                from mcp import ClientSession
+                from mcp.client.streamable_http import streamable_http_client
+
+                async with httpx2.AsyncClient(
+                    headers={"Authorization": f"Bearer {token}"},
+                ) as http_client:
+                    async with streamable_http_client(url, http_client=http_client) as streams:
+                        read_stream, write_stream, *_ = streams
+                        async with ClientSession(read_stream, write_stream) as session:
+                            await session.initialize()
+                            result = await session.list_tools()
+                            return {tool.name for tool in result.tools}
+
+            tools = asyncio.run(list_tools())
+            assert tools == {
+                "conversations_list", "conversation_get", "messages_read", "attachments_fetch",
+                "events_poll", "events_wait", "messages_send", "channels_list",
+                "permissions_list_open", "permissions_respond",
+            }
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=10)
+
+
+class TestBearerTokenApp:
+    @staticmethod
+    def _request(app, authorization=None):
+        sent = []
+        headers = [] if authorization is None else [(b"authorization", authorization.encode())]
+
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        async def send(message):
+            sent.append(message)
+
+        asyncio.run(app({"type": "http", "headers": headers}, receive, send))
+        return sent
+
+    def test_rejects_missing_token_without_entering_wrapped_app(self):
+        import mcp_serve
+
+        entered = []
+
+        async def wrapped(scope, receive, send):
+            entered.append(scope)
+
+        app = mcp_serve._BearerTokenApp(wrapped, "secret-token")
+        sent = self._request(app)
+
+        assert entered == []
+        assert sent[0]["status"] == 401
+        assert (b"www-authenticate", b"Bearer") in sent[0]["headers"]
+
+    def test_accepts_matching_bearer_token(self):
+        import mcp_serve
+
+        entered = []
+
+        async def wrapped(scope, receive, send):
+            entered.append(scope)
+
+        app = mcp_serve._BearerTokenApp(wrapped, "secret-token")
+        sent = self._request(app, "Bearer secret-token")
+
+        assert sent == []
+        assert len(entered) == 1
+
+
 class TestCliIntegration:
 
     def test_dispatcher_routes_serve(self, monkeypatch, tmp_path):
@@ -915,10 +1098,57 @@ class TestCliIntegration:
         monkeypatch.setattr("mcp_serve.run_mcp_server", mock_run)
 
         import argparse
-        args = argparse.Namespace(mcp_action="serve", verbose=True)
+        args = argparse.Namespace(
+            mcp_action="serve",
+            verbose=True,
+            transport="streamable-http",
+            host="127.0.0.1",
+            port=9123,
+            mcp_path="/bridge",
+            auth_token_env="MCP_TEST_TOKEN",
+            allow_unauthenticated=False,
+            ssl_certfile="cert.pem",
+            ssl_keyfile="key.pem",
+        )
         from hermes_cli.mcp_config import mcp_command
         mcp_command(args)
-        mock_run.assert_called_once_with(verbose=True)
+        mock_run.assert_called_once_with(
+            verbose=True,
+            transport="streamable-http",
+            host="127.0.0.1",
+            port=9123,
+            path="/bridge",
+            auth_token_env="MCP_TEST_TOKEN",
+            allow_unauthenticated=False,
+            ssl_certfile="cert.pem",
+            ssl_keyfile="key.pem",
+        )
+
+    def test_parser_exposes_streamable_http_options(self):
+        import argparse
+
+        from hermes_cli.subcommands.mcp import build_mcp_parser
+
+        parser = argparse.ArgumentParser(prog="hermes")
+        build_mcp_parser(parser.add_subparsers(dest="command"), cmd_mcp=lambda args: args)
+        args = parser.parse_args([
+            "mcp", "serve",
+            "--transport", "streamable-http",
+            "--host", "0.0.0.0",
+            "--port", "9123",
+            "--path", "/bridge",
+            "--auth-token-env", "MCP_TEST_TOKEN",
+            "--ssl-certfile", "cert.pem",
+            "--ssl-keyfile", "key.pem",
+        ])
+
+        assert args.transport == "streamable-http"
+        assert args.host == "0.0.0.0"
+        assert args.port == 9123
+        assert args.mcp_path == "/bridge"
+        assert args.auth_token_env == "MCP_TEST_TOKEN"
+        assert args.ssl_certfile == "cert.pem"
+        assert args.ssl_keyfile == "key.pem"
 
 # ---------------------------------------------------------------------------
 # 6. EDGE CASES

@@ -8,6 +8,16 @@ from typing import Callable
 from hermes_cli.subcommands._shared import add_accept_hooks_flag
 
 
+def _port(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("port must be an integer") from exc
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be between 1 and 65535")
+    return port
+
+
 def build_mcp_parser(subparsers, *, cmd_mcp: Callable) -> None:
     """Attach the ``mcp`` subcommand to ``subparsers``."""
     mcp_parser = subparsers.add_parser(
@@ -22,6 +32,28 @@ def build_mcp_parser(subparsers, *, cmd_mcp: Callable) -> None:
         "serve", help="Run Hermes as an MCP server (expose conversations to other agents)")
     mcp_serve_p.add_argument(
         "-v", "--verbose", action="store_true", help="Enable verbose logging on stderr")
+    mcp_serve_p.add_argument(
+        "--transport", choices=("stdio", "streamable-http"), default="stdio",
+        help="Server transport (default: stdio)")
+    mcp_serve_p.add_argument(
+        "--host", default="127.0.0.1",
+        help="Streamable HTTP bind host (default: 127.0.0.1)")
+    mcp_serve_p.add_argument(
+        "--port", type=_port, default=8000,
+        help="Streamable HTTP bind port (default: 8000)")
+    mcp_serve_p.add_argument(
+        "--path", dest="mcp_path", default="/mcp",
+        help="Streamable HTTP endpoint path (default: /mcp)")
+    mcp_serve_p.add_argument(
+        "--auth-token-env", default="HERMES_MCP_AUTH_TOKEN", metavar="NAME",
+        help="Environment variable containing the HTTP bearer token")
+    mcp_serve_p.add_argument(
+        "--allow-unauthenticated", action="store_true",
+        help="Allow an unauthenticated Streamable HTTP bind outside loopback")
+    mcp_serve_p.add_argument(
+        "--ssl-certfile", help="TLS certificate chain for HTTPS")
+    mcp_serve_p.add_argument(
+        "--ssl-keyfile", help="TLS private key for HTTPS")
     add_accept_hooks_flag(mcp_serve_p)
 
     mcp_add_p = mcp_sub.add_parser("add", help="Add an MCP server (discovery-first install)")

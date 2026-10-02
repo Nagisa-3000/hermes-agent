@@ -1006,7 +1006,38 @@ In addition to connecting **to** MCP servers, Hermes can also **be** an MCP serv
 hermes mcp serve
 ```
 
-This starts a stdio MCP server. The MCP client (not you) manages the process lifecycle.
+This starts a stdio MCP server. The MCP client manages the process lifecycle.
+
+To run a local Streamable HTTP endpoint instead:
+
+```bash
+hermes mcp serve --transport streamable-http
+# Endpoint: http://127.0.0.1:8000/mcp
+```
+
+The HTTP transport binds to loopback by default. A non-loopback bind requires a
+Bearer token unless you explicitly pass `--allow-unauthenticated`:
+
+```bash
+export HERMES_MCP_AUTH_TOKEN="$(openssl rand -hex 32)"
+hermes mcp serve --transport streamable-http --host 0.0.0.0 --port 8000
+```
+
+Clients must send `Authorization: Bearer <token>` on every MCP request. The token
+is read from `HERMES_MCP_AUTH_TOKEN` by default; use `--auth-token-env NAME` to
+select a different environment variable without placing the secret in shell history.
+
+For direct HTTPS, provide a certificate chain and its private key together:
+
+```bash
+hermes mcp serve --transport streamable-http \
+  --host 0.0.0.0 \
+  --ssl-certfile /etc/letsencrypt/live/mcp.example.com/fullchain.pem \
+  --ssl-keyfile /etc/letsencrypt/live/mcp.example.com/privkey.pem
+```
+
+You can also keep Hermes on loopback and terminate TLS and authentication at a
+reverse proxy. In either deployment, expose only the configured endpoint path.
 
 ### MCP client configuration
 
@@ -1072,9 +1103,24 @@ The event queue is in-memory and starts when the bridge connects. Older messages
 ### Options
 
 ```bash
-hermes mcp serve              # Normal mode
-hermes mcp serve --verbose    # Debug logging on stderr
+hermes mcp serve                                      # stdio (default)
+hermes mcp serve --verbose                            # debug logging on stderr
+hermes mcp serve --transport streamable-http          # http://127.0.0.1:8000/mcp
+hermes mcp serve --transport streamable-http \
+  --host 127.0.0.1 --port 9000 --path /hermes-mcp
 ```
+
+Streamable HTTP options:
+
+| Option | Default | Purpose |
+|--------|---------|---------|
+| `--host` | `127.0.0.1` | Bind host. Non-loopback binds require authentication by default. |
+| `--port` | `8000` | TCP port. |
+| `--path` | `/mcp` | MCP endpoint path. |
+| `--auth-token-env` | `HERMES_MCP_AUTH_TOKEN` | Environment variable containing the Bearer token. |
+| `--allow-unauthenticated` | off | Explicitly permit an unauthenticated non-loopback bind. |
+| `--ssl-certfile` | — | TLS certificate chain; requires `--ssl-keyfile`. |
+| `--ssl-keyfile` | — | TLS private key; requires `--ssl-certfile`. |
 
 ### How it works
 
@@ -1084,7 +1130,7 @@ The gateway does NOT need to be running for read operations (listing conversatio
 
 ### Current limits
 
-- The embedded `hermes mcp serve` exposes a **stdio-only** MCP server today. If you need an HTTP MCP server, run a separate adapter — or, much more commonly, use the MCP **client** side of Hermes, which already speaks both stdio and HTTP (`url` + `headers` in `mcp_servers.yaml` / `config.yaml`; see [HTTP servers](#http-servers) above).
+- Server-side HTTP authentication is a static Bearer token. OAuth discovery and token issuance are not embedded; use a reverse proxy when you need those policies.
 - Event polling at ~200ms intervals via mtime-optimized DB polling (skips work when files are unchanged)
 - No `claude/channel` push notification protocol yet
 - Text-only sends (no media/attachment sending through `messages_send`)
