@@ -1480,6 +1480,97 @@ def test_sessionless_slash_palette_follows_profile_param(server, tmp_path, monke
         set_multiplex_active(previous)
 
 
+def _complete_path_env(server, tmp_path, monkeypatch, chat_backend):
+    """Profile homes + a session whose chat profile runs ``chat_backend``; the launch
+    profile runs docker. Returns (workspace dir, terminal_tool call recorder)."""
+    monkeypatch.delenv("TERMINAL_ENV", raising=False)
+    # The server fixture's import window binds ``hermes_constants`` to a MagicMock while
+    # tui_gateway.server imports, so server's ``from hermes_constants import …`` names
+    # (get_hermes_home_override among them) stay poisoned for the process lifetime.
+    # Restore the real override-aware getters — ``_active_config_path`` must see the
+    # session scope's profile home, and relay's lifecycle hooks need a Path home.
+    import agent.relay_runtime as relay_runtime
+    import hermes_constants
+    monkeypatch.setattr(relay_runtime, "get_hermes_home", hermes_constants.get_hermes_home)
+    monkeypatch.setattr(server, "get_hermes_home", hermes_constants.get_hermes_home)
+    monkeypatch.setattr(server, "get_hermes_home_override", hermes_constants.get_hermes_home_override)
+    root = tmp_path / "hermes_home"
+    (root / "profiles" / "chat-a").mkdir(parents=True)
+    (root / "config.yaml").write_text("terminal:\n  backend: docker\n")
+    (root / "profiles" / "chat-a" / "config.yaml").write_text(f"terminal:\n  backend: {chat_backend}\n")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setattr(server, "_hermes_home", str(root))
+
+    workspace = tmp_path / "ws"
+    (workspace / "src").mkdir(parents=True)
+    (workspace / "report.md").write_text("# report\n")
+
+    server._sessions["sess-a"] = {
+        "session_key": "sess-a-key",
+        "profile_home": str(root / "profiles" / "chat-a"),
+        "cwd": str(workspace),
+    }
+
+    calls = []
+
+    def _recorder(command, **kwargs):
+        calls.append((command, kwargs))
+        return json.dumps({"output": "src/\nREADME.md\n", "exit_code": 0})
+
+    monkeypatch.setattr("tools.terminal_tool.terminal_tool", _recorder)
+    return workspace, calls
+
+
+def test_complete_path_local_chat_lists_the_host_tree_on_a_docker_launch(server, tmp_path, monkeypatch):
+    """A chat whose OWN profile is local must complete from the HOST tree even when the
+    launch profile runs docker: the unscoped read leaked the launch backend into every
+    other profile's chat (#131751)."""
+    workspace, calls = _complete_path_env(server, tmp_path, monkeypatch, chat_backend="local")
+
+    resp = server.handle_request({
+        "id": "c1", "method": "complete.path",
+        "params": {"session_id": "sess-a", "word": "@file:", "cwd": str(workspace)}})
+
+    assert "result" in resp, resp
+    texts = {item["text"] for item in resp["result"]["items"]}
+    assert "@file:report.md" in texts
+    assert calls == []  # the host listing never touches a terminal backend
+
+
+def test_complete_path_backend_chat_never_spawns_a_foreign_sandbox(server, tmp_path, monkeypatch):
+    """A docker-profile chat with NO live environment gets an empty listing and spawns
+    nothing: Desktop re-fires completion on every reconnect, so the old cold-start piled
+    up launch-profile containers keyed by other profiles' session ids (#131751)."""
+    workspace, calls = _complete_path_env(server, tmp_path, monkeypatch, chat_backend="docker")
+
+    resp = server.handle_request({
+        "id": "c2", "method": "complete.path",
+        "params": {"session_id": "sess-a", "word": "@file:", "cwd": str(workspace)}})
+
+    assert "result" in resp, resp
+    assert resp["result"]["items"] == []
+    assert calls == []  # no sandbox was created, no command was run
+
+
+def test_complete_path_backend_chat_lists_inside_a_live_environment(server, tmp_path, monkeypatch):
+    """With the chat's environment already running, the listing still works — routed to
+    the session's own backend key, pre-confirmed (#115478)."""
+    workspace, calls = _complete_path_env(server, tmp_path, monkeypatch, chat_backend="docker")
+    monkeypatch.setattr(
+        "tools.terminal_tool_lifecycle.get_active_env", lambda task_id: object())
+
+    resp = server.handle_request({
+        "id": "c3", "method": "complete.path",
+        "params": {"session_id": "sess-a", "word": "@file:", "cwd": str(workspace)}})
+
+    assert "result" in resp, resp
+    texts = {item["text"] for item in resp["result"]["items"]}
+    assert "@file:README.md" in texts
+    assert len(calls) == 1
+    assert calls[0][1]["task_id"] == "sess-a-key"
+    assert calls[0][1]["force"] is True
+
+
 class _BannerWorker:
     """Stand-in for the slash worker's current skill path: ok-reply the banner."""
 

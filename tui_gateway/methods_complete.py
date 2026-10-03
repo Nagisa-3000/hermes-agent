@@ -154,7 +154,11 @@ def _backend_dir_entries(search_dir: str, session_key: str | None) -> list[tuple
 
     Runs in the session's own backend (``task_id`` = session key), so relative paths and ``~`` resolve
     where the agent's commands do. Completion is advisory: an unreachable backend yields nothing —
-    falling back to the gateway host would show a plausible but wrong tree (#112963).
+    falling back to the gateway host would show a plausible but wrong tree (#112963). It is also a
+    read-only peek at an ALREADY-RUNNING backend: with no live environment for the session there is
+    nothing to list, and letting ``terminal_tool`` create one would cold-start a sandbox per refresh —
+    Desktop re-fires this on every gateway reconnect, so an idle chat piled up foreign containers
+    (#131751).
     """
     import json
     import shlex
@@ -164,6 +168,12 @@ def _backend_dir_entries(search_dir: str, session_key: str | None) -> list[tuple
         'for p in "$d"/* "$d"/.[!.]* "$d"/..?*; do [ -e "$p" ] || [ -L "$p" ] || continue; '
         'if [ -d "$p" ]; then printf "%s/\\n" "${p##*/}"; else printf "%s\\n" "${p##*/}"; fi; done'
     )
+    try:
+        from tools.terminal_tool_lifecycle import get_active_env
+        if get_active_env(session_key) is None:
+            return []
+    except Exception:
+        return []
     try:
         from hermes_cli.observability.shared_metrics_loop import unmetered_backend_calls
         from tools.terminal_tool import terminal_tool
@@ -237,42 +247,49 @@ def _(rid, params: dict) -> dict:
     if not word:
         return _ok(rid, {"items": []})
     session = _sessions.get(params.get("session_id", ""))
-    local = _effective_terminal_backend() == "local"
-    # A non-local backend's cwd lives inside the target; the host cannot validate it, so take the composer's
-    # session cwd (Desktop sends it) or the session's terminal cwd as-is.
-    root = _completion_cwd(params) if local else (params.get("cwd") or _terminal_task_cwd(session))
-    session_key = session.get("session_key") if session else None
-    is_context = word.startswith("@")
-    query = word[1:] if is_context else word
-    if is_context and not query:
-        return _ok(rid, {"items": _at_root_items()})
-    # Plugin `@<prefix>:<query>` runs before the built-in file/folder branching.
-    if is_context and ":" in query:
-        pfx, _, qval = query.partition(":")
-        if pfx not in _BUILTIN_AT_PREFIXES and (plugin_items := _plugin_reference_items(pfx, qval)) is not None:
-            return _ok(rid, {"items": plugin_items})
-    # Bare `@folder` lists as soon as the keyword is typed (the static `@folder:` hint is not accepted).
-    if is_context and (query in {"file", "folder"} or query.startswith(("file:", "folder:"))):
-        prefix_tag, _, path_part = query.partition(":")
-    else:
-        prefix_tag, path_part = "", query
-    # `@/foo` usually means "foo, from here": absolute only when that prefix exists,
-    # else resolve relative to cwd (`@/Desktop` must not dead-end; `@/usr/local` still resolves).
-    # Host probes (this one and the fuzzy repo walk) say nothing about a non-local backend's tree.
-    if (
-        is_context and path_part.startswith("/") and not path_part.startswith("//")
-        and local and not _abs_completion_prefix_exists(path_part)):
-        path_part = path_part.lstrip("/")
-    bare_word = is_context and path_part and "/" not in path_part
-    if local and bare_word and len(path_part.strip()) >= 2 and prefix_tag != "folder":
-        items = _fuzzy_basename_items(root, path_part, prefix_tag)
-    else:
-        items = _dir_listing_items(root, word, path_part, prefix_tag, is_context, session_key)
-    # Bare-word `@name` may be an agent mention: profiles rank ABOVE file hits.
-    if bare_word and not prefix_tag:
-        with contextlib.suppress(Exception):
-            items = _profile_mention_items(path_part) + items
-    return _ok(rid, {"items": items})
+    # Bind the chat's profile before resolving any backend: unscoped, `_effective_terminal_backend`
+    # reports the LAUNCH profile's, so a Desktop chat on profile A listed files through profile B's
+    # docker backend — cold-starting a foreign sandbox per refresh, keyed by A's session id (#131751).
+    # `complete.slash` binds the same scope for its home-keyed lookups (#114359); a session-less draft
+    # names its rail-selected `profile` (#124651), and a TUI composer pre-session stays on the launch
+    # profile it genuinely runs under.
+    with _session_home_scope(session, cwd=_completion_cwd(params), profile=params.get("profile")):
+        local = _effective_terminal_backend() == "local"
+        # A non-local backend's cwd lives inside the target; the host cannot validate it, so take the composer's
+        # session cwd (Desktop sends it) or the session's terminal cwd as-is.
+        root = _completion_cwd(params) if local else (params.get("cwd") or _terminal_task_cwd(session))
+        session_key = session.get("session_key") if session else None
+        is_context = word.startswith("@")
+        query = word[1:] if is_context else word
+        if is_context and not query:
+            return _ok(rid, {"items": _at_root_items()})
+        # Plugin `@<prefix>:<query>` runs before the built-in file/folder branching.
+        if is_context and ":" in query:
+            pfx, _, qval = query.partition(":")
+            if pfx not in _BUILTIN_AT_PREFIXES and (plugin_items := _plugin_reference_items(pfx, qval)) is not None:
+                return _ok(rid, {"items": plugin_items})
+        # Bare `@folder` lists as soon as the keyword is typed (the static `@folder:` hint is not accepted).
+        if is_context and (query in {"file", "folder"} or query.startswith(("file:", "folder:"))):
+            prefix_tag, _, path_part = query.partition(":")
+        else:
+            prefix_tag, path_part = "", query
+        # `@/foo` usually means "foo, from here": absolute only when that prefix exists,
+        # else resolve relative to cwd (`@/Desktop` must not dead-end; `@/usr/local` still resolves).
+        # Host probes (this one and the fuzzy repo walk) say nothing about a non-local backend's tree.
+        if (
+            is_context and path_part.startswith("/") and not path_part.startswith("//")
+            and local and not _abs_completion_prefix_exists(path_part)):
+            path_part = path_part.lstrip("/")
+        bare_word = is_context and path_part and "/" not in path_part
+        if local and bare_word and len(path_part.strip()) >= 2 and prefix_tag != "folder":
+            items = _fuzzy_basename_items(root, path_part, prefix_tag)
+        else:
+            items = _dir_listing_items(root, word, path_part, prefix_tag, is_context, session_key)
+        # Bare-word `@name` may be an agent mention: profiles rank ABOVE file hits.
+        if bare_word and not prefix_tag:
+            with contextlib.suppress(Exception):
+                items = _profile_mention_items(path_part) + items
+        return _ok(rid, {"items": items})
 
 
 @method("complete.slash")

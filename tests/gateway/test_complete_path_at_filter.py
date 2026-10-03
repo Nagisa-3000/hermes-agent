@@ -92,6 +92,11 @@ def _fake_remote_backend(monkeypatch, remote_root: Path) -> list:
     import subprocess
 
     import tools.terminal_tool as terminal_tool_mod
+    import tools.terminal_tool_lifecycle as lifecycle_mod
+
+    # A backend that answers is a backend whose environment is already running: the
+    # advisory listing refuses to cold-start one (#131751).
+    monkeypatch.setattr(lifecycle_mod, "get_active_env", lambda task_id: object())
 
     calls = []
 
