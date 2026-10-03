@@ -19,12 +19,11 @@ const paths = vi.hoisted(() => [
 ])
 
 const getSessionMessages = vi.hoisted(() => vi.fn())
+const listAllProfileSessions = vi.hoisted(() => vi.fn())
 
 vi.mock('@/hermes', async () => ({
   ...(await vi.importActual('@/hermes')),
-  listAllProfileSessions: async () => ({
-    sessions: [{ id: 'artifact-session', title: 'Fixture', profile: 'origin-profile' }]
-  }),
+  listAllProfileSessions,
   getSessionMessages
 }))
 afterEach(() => {
@@ -35,6 +34,9 @@ afterEach(() => {
 })
 
 it('keeps discovered file paths and originating session scope intact through remote opening', async () => {
+  listAllProfileSessions.mockResolvedValue({
+    sessions: [{ id: 'artifact-session', title: 'Fixture', profile: 'origin-profile' }]
+  })
   getSessionMessages.mockResolvedValue({
     messages: [
       {
@@ -98,4 +100,24 @@ it('keeps discovered file paths and originating session scope intact through rem
     offset: 0,
     order: 'oldest'
   })
+})
+
+it('reads a registry-owned session through its owning connection', async () => {
+  listAllProfileSessions.mockResolvedValueOnce({
+    sessions: [{ id: 'voyo-session', title: 'Remote', profile: 'default', connection_id: 'voyo' }]
+  })
+  getSessionMessages.mockResolvedValue({ messages: [], session_id: 'voyo-session' })
+  render(
+    <MemoryRouter>
+      <ArtifactsView />
+    </MemoryRouter>
+  )
+
+  await waitFor(() =>
+    expect(getSessionMessages).toHaveBeenCalledWith(
+      'voyo-session',
+      { connectionId: 'voyo', profile: 'default' },
+      expect.objectContaining({ includeCompacted: true, offset: 0, order: 'oldest' })
+    )
+  )
 })
