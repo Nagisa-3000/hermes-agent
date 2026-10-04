@@ -41,6 +41,7 @@ class TurnRetryState:
 
     # Transport / rate-limit recovery
     primary_recovery_attempted: bool = False
+    managed_endpoint_retry_attempted: bool = False
     has_retried_429: bool = False
     # Persistent 401/403 already escalated to the fallback chain once this attempt.
     auth_failover_attempted: bool = False
