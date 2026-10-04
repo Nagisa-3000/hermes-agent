@@ -2,6 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { MemoryRouter } from 'react-router'
 import { afterEach, expect, it, vi } from 'vitest'
 
+import type * as HermesClient from '@/hermes'
 import { $connection } from '@/store/session'
 
 import { ArtifactsView } from './index'
@@ -106,7 +107,10 @@ it('reads a registry-owned session through its owning connection', async () => {
   listAllProfileSessions.mockResolvedValueOnce({
     sessions: [{ id: 'voyo-session', title: 'Remote', profile: 'default', connection_id: 'voyo' }]
   })
-  getSessionMessages.mockResolvedValue({ messages: [], session_id: 'voyo-session' })
+  const client = await vi.importActual<typeof HermesClient>('@/hermes')
+  const api = vi.fn().mockResolvedValue({ messages: [], session_id: 'voyo-session' })
+  vi.stubGlobal('hermesDesktop', { api })
+  getSessionMessages.mockImplementation(client.getSessionMessages)
   render(
     <MemoryRouter>
       <ArtifactsView />
@@ -120,4 +124,14 @@ it('reads a registry-owned session through its owning connection', async () => {
       expect.objectContaining({ includeCompacted: true, offset: 0, order: 'oldest' })
     )
   )
+
+  expect(api).toHaveBeenCalledWith(expect.objectContaining({ connectionId: 'voyo', profile: 'default' }))
+  const path = new URL(api.mock.calls[0][0].path, 'http://localhost')
+  expect(path.pathname).toBe('/api/sessions/voyo-session/messages')
+  expect(Object.fromEntries(path.searchParams)).toMatchObject({
+    profile: 'default',
+    include_compacted: 'true',
+    offset: '0',
+    order: 'oldest'
+  })
 })
