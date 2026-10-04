@@ -74,6 +74,7 @@ import {
   persistedTurnsEquivalent,
   transcriptRowIds
 } from './pending-turn-identity'
+import { acknowledgedSteeringMessages } from './steering-reconciliation'
 
 function withAppendedText(message: ChatMessage, suffix: string): ChatMessage {
   let appended = false
@@ -253,7 +254,8 @@ const COMPARED_FIELDS = [
   'completedAt',
   // Turn wall-clock duration — stamps the visible "⏱ 38s" badge, so a change
   // must re-render (set once at completion; stable afterwards).
-  'durationS'
+  'durationS',
+  'steering'
 ] as const
 
 const IGNORED_FIELDS = ['attachmentRefs', 'parts', 'serverRowSpan'] as const
@@ -360,6 +362,7 @@ export function chatMessagesEquivalent(a: ChatMessage, b: ChatMessage): boolean 
     a.rowId !== b.rowId ||
     !persistedTurnsEquivalent(a.persistedTurn, b.persistedTurn) ||
     a.role !== b.role ||
+    (a.steering ?? false) !== (b.steering ?? false) ||
     a.durableComplete !== b.durableComplete ||
     a.recovered !== b.recovered ||
     a.pending !== b.pending ||
@@ -911,6 +914,11 @@ export function preserveLocalPendingTurnMessages(
       (message.rowId !== undefined || message === newestAuthoritativeUser)
   )
 
+  const acknowledgedSteers = acknowledgedSteeringMessages(
+    acknowledgedUserCandidates,
+    previousMessages.slice(acknowledged.localIndex + 1)
+  )
+
   const preserved: ChatMessage[] = []
   // Authoritative id → richer local pending row. Replacing (not appending)
   // avoids painting both the empty inflight shell and the full stream bubble.
@@ -1021,18 +1029,20 @@ export function preserveLocalPendingTurnMessages(
 
     if (
       isOptimisticUser &&
-      acknowledgedUserCandidates.some(
-        candidate =>
-          // #122079: the tolerant arm widens the TEXT compare only — it stays
-          // inside the identity gate, so a rowId-bearing optimistic row is
-          // never swallowed by a committed row it provably is not (a genuine
-          // repeat of the same captioned paste). The rowId-less paste from
-          // #120978 carries no identity and keeps matching tolerantly.
-          !conflictingTranscriptIdentity(message, candidate) &&
-          (textWithoutReferenceLines(chatMessageText(candidate)) ===
-            textWithoutReferenceLines(chatMessageText(message)) ||
-            sameAttachmentTurn(candidate, message))
-      )
+      (message.steering
+        ? acknowledgedSteers.has(message.id)
+        : acknowledgedUserCandidates.some(
+            candidate =>
+              // #122079: the tolerant arm widens the TEXT compare only — it stays
+              // inside the identity gate, so a rowId-bearing optimistic row is
+              // never swallowed by a committed row it provably is not (a genuine
+              // repeat of the same captioned paste). The rowId-less paste from
+              // #120978 carries no identity and keeps matching tolerantly.
+              !conflictingTranscriptIdentity(message, candidate) &&
+              (textWithoutReferenceLines(chatMessageText(candidate)) ===
+                textWithoutReferenceLines(chatMessageText(message)) ||
+                sameAttachmentTurn(candidate, message))
+          ))
     ) {
       continue
     }
@@ -1076,8 +1086,9 @@ export function preserveLocalPendingTurnMessages(
       }
 
       if (
+        !message.steering &&
         textWithoutReferenceLines(chatMessageText(authoritative)) ===
-        textWithoutReferenceLines(chatMessageText(message))
+          textWithoutReferenceLines(chatMessageText(message))
       ) {
         continue
       }
