@@ -2455,20 +2455,13 @@ def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None, extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None, execution_id: Optional[str] = None,
 ) -> tuple[bool, str, str, Optional[str]]:
-    """Execute a single cron job. Returns (success, full_output_doc, final_response, error).
-    ``defer_agent_teardown``: if a list, the live agent is appended instead of torn down; the caller
-    MUST call ``_teardown_cron_agent(agent)`` AFTER delivery (a torn-down async client can't
-    deliver). ``extra_prompt``: per-fire context, never persisted.
+    """Execute one cron job; return (success, output document, final response, error).
 
-    ``defer_agent_teardown``: when a caller passes a list, ``run_job`` skips the agent's async-resource
-    teardown (``agent.close()`` + ``cleanup_stale_async_clients()``) in its ``finally`` block and instead
-    appends the live agent to that list. The caller is then responsible for calling
-    ``_teardown_cron_agent(agent)`` AFTER it has delivered the result. This closes the ordering window in
-    #58720 where delivery ran against a torn-down async client (defense-in-depth alongside the
-    interpreter-shutdown guard). When ``None`` (the default) teardown happens inline as before, so every
-    existing caller is unchanged.
-    ``extra_prompt``: optional per-run context from ``cronjob(action='run', prompt=...)`` (#57331). Appended
-    to the stored prompt for this fire only — never persisted to the job definition.
+    ``defer_agent_teardown`` collects profile-bound cleanup callables retaining the live agent
+    and its run owner. The caller MUST invoke them AFTER delivery: closing the async client first
+    races delivery (#58720). With ``None``, cleanup starts inline. A bounded cleanup timeout lets
+    the scheduler proceed; the run owner stays registered until the cleanup thread finishes.
+    ``extra_prompt`` is per-fire context from cronjob(action='run', prompt=...), never persisted.
     """
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
@@ -2569,7 +2562,8 @@ def run_job(
 
 
 def _teardown_cron_agent(
-    agent, job_id: str, *, timeout_seconds: Optional[float] = None
+    agent, job_id: str, *, timeout_seconds: Optional[float] = None,
+    on_finish: Optional[Callable[[], None]] = None,
 ) -> None:
     """Release an ephemeral cron agent's async resources within a hard bound (this runs outside the
     inactivity watchdog). Shared by ``run_job``'s finally and deferred post-delivery teardown.
@@ -2578,22 +2572,12 @@ def _teardown_cron_agent(
     invoke the identical cleanup AFTER delivery. The timeout matters because this executes after
     ``run_conversation`` has returned, outside the agent inactivity watchdog.
     """
-    def _cleanup_agent() -> None:
-        try:
-            if agent is not None:
-                agent.close()
-        except (Exception, KeyboardInterrupt) as e:
-            logger.debug("Job '%s': failed to close agent resources: %s", job_id, e)
-        # Worker-thread event loop dies with the executor; reap httpx clients cached under it.
-        try:
-            from agent.auxiliary_client import cleanup_stale_async_clients
-            cleanup_stale_async_clients()
-        except Exception as e:
-            logger.debug("Job '%s': failed to reap stale auxiliary clients: %s", job_id, e)
+    from functools import partial
+    from cron.scheduler_run_cleanup import close_cron_agent_resources
 
     _run_cron_cleanup_with_timeout(
-        _cleanup_agent, job_id=job_id, label="agent resource teardown",
-        timeout_seconds=timeout_seconds)
+        partial(close_cron_agent_resources, agent, job_id, on_finish=on_finish),
+        job_id=job_id, label="agent resource teardown", timeout_seconds=timeout_seconds)
 
 
 def _run_with_fire_claim_heartbeat(job: dict, run) -> bool:
@@ -3270,18 +3254,18 @@ def _run_one_job_body(
 
         _terminal_scope_token = install_profile_terminal_scope(_get_hermes_home())
         # Defer agent teardown until AFTER delivery: closing first races the live send against a
-        # torn-down async client (#58720). run_job hands the agent back via this list instead.
+        # torn-down async client (#58720). run_job hands back profile-bound cleanup actions via this list.
         _deferred_agents: list = []
 
         def _teardown_deferred() -> None:
-            # run_job's finally still hands back the agent when it raises; tear it down here so a failed run
+            # run_job's finally still queues cleanup when it raises; run it here so a failed run
             # never leaks its async resources (#10200), then re-raise into the outer handler. BaseException
             # (not just Exception) so a KeyboardInterrupt/SystemExit mid-run still triggers teardown before
             # propagating.
             # Tear down the deferred agent(s) now that save + delivery have run (or raised). Must happen on
             # every path so cron agents never leak their subprocesses/clients (#10200).
-            for _deferred_agent in _deferred_agents:
-                _teardown_cron_agent(_deferred_agent, job["id"])
+            for teardown in _deferred_agents:
+                teardown()
 
         _run_kwargs = {
             "defer_agent_teardown": _deferred_agents,
@@ -3292,7 +3276,7 @@ def _run_one_job_body(
         try:
             success, output, final_response, error = run_job(job, **_run_kwargs)
         except BaseException:
-            # run_job hands back the agent even when raising; tear down so a failed run never leaks.
+            # run_job queues cleanup even when raising; run it so a failed run never leaks.
             # BaseException so KeyboardInterrupt/SystemExit mid-run still trigger teardown.
             _teardown_deferred()
             raise

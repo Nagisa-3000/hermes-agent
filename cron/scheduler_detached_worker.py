@@ -47,11 +47,7 @@ def defer_teardown_to_running_worker(
                 _finalize_cron_session(session_db, agent, job_id, job_name, cron_session_id,
                                        workdir=workdir)
         finally:
-            try:
-                _teardown_cron_agent(agent, job_id)
-            finally:
-                if on_finish is not None:
-                    on_finish()
+            _teardown_cron_agent(agent, job_id, on_finish=on_finish)
 
     context = contextvars.copy_context()
 

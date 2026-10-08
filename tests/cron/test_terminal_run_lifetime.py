@@ -1,9 +1,10 @@
 """Cron terminal ownership follows the worker lifetime, including detached workers."""
 import json
+import time
 from concurrent.futures import Future
 from contextvars import copy_context
 from pathlib import Path
-from threading import Thread
+from threading import Event, Thread
 
 import pytest
 
@@ -28,21 +29,15 @@ def _homes(tmp_path, monkeypatch):
     return default, work
 
 
-@pytest.mark.parametrize("pending", [False, True])
-@pytest.mark.parametrize("profile", ["default", "work"])
-def test_run_job_retains_owner_until_worker_and_cleanup_finish(tmp_path, monkeypatch, pending, profile):
-    default, work = _homes(tmp_path, monkeypatch)
-    home = default if profile == "default" else work
-    observed = {}
-    future = Future()
-    future.set_running_or_notify_cancel()
-
+def _controlled_agent(monkeypatch, observed, future, pending, release):
     class FakeAgent:
         def __init__(self, **kwargs):
             pass
 
         def close(self):
             observed["close_key"] = terminal_tool._resolve_container_task_id(observed["task_id"])
+            observed["close_entered"].set()
+            assert release.wait(timeout=30)
             cleanup_vm(observed["key"])
 
     monkeypatch.setattr("run_agent.AIAgent", FakeAgent)
@@ -62,26 +57,101 @@ def test_run_job_retains_owner_until_worker_and_cleanup_finish(tmp_path, monkeyp
         return {"final_response": "done"}
 
     monkeypatch.setattr(scheduler, "_run_agent_with_watchdog", controlled_worker)
+
+
+def _wait_for_release(context, task_id, key):
+    deadline = time.monotonic() + 10
+    while context.run(terminal_tool._resolve_container_task_id, task_id) == key and time.monotonic() < deadline:
+        Event().wait(0.01)
+    assert context.run(terminal_tool._resolve_container_task_id, task_id) != key
+
+
+@pytest.mark.parametrize("pending", [False, True])
+@pytest.mark.parametrize("profile", ["default", "work"])
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("slow_cleanup", [False, True])
+def test_run_job_retains_owner_until_worker_and_cleanup_finish(tmp_path, monkeypatch, pending, profile, deferred, slow_cleanup):
+    default, work = _homes(tmp_path, monkeypatch)
+    home = default if profile == "default" else work
+    observed = {"close_entered": Event()}
+    future = Future()
+    future.set_running_or_notify_cancel()
+    release = Event()
+    if not slow_cleanup:
+        release.set()
+    _controlled_agent(monkeypatch, observed, future, pending, release)
+    monkeypatch.setattr(scheduler, "_cron_cleanup_timeout_seconds", lambda: 0.02 if slow_cleanup else 10)
+    deferred_agents = [] if deferred else None
     try:
         with gateway._session_profile_runtime_scope({"profile_home": str(home)}, hydrate_secrets=False):
-            assert scheduler.run_job({"id": "lifetime-job", "prompt": "hello"}, execution_id="same-run")[0]
+            assert scheduler.run_job({"id": "lifetime-job", "prompt": "hello"}, execution_id="same-run",
+                                     defer_agent_teardown=deferred_agents)[0]
             context = observed["context"]
-            if pending:
+            if pending or deferred or slow_cleanup:
                 assert context.run(terminal_tool._resolve_container_task_id, observed["task_id"]) == observed["key"]
                 late = json.loads(context.run(terminal_tool.terminal_tool,
                     'printf %s "$CRON_LIFETIME_PROBE"', task_id=observed["task_id"]))
                 assert late["output"] == "own-run"
         if pending:
-            # The completing thread has no profile bindings or caller-created ContextVar tokens.
             completion = Thread(target=future.set_result, args=({"final_response": "late"},))
             completion.start()
             completion.join(timeout=10)
             assert not completion.is_alive()
+        elif deferred:
+            assert len(deferred_agents) == 1
+            # Called after leaving the owning profile; the deferred action must carry its context.
+            deferred_agents.pop()()
+        assert observed["close_entered"].wait(timeout=10)
         assert observed["close_key"] == observed["key"]
-        assert context.run(terminal_tool._resolve_container_task_id, observed["task_id"]) != observed["key"]
+        if slow_cleanup:
+            assert context.run(terminal_tool._resolve_container_task_id, observed["task_id"]) == observed["key"]
+        release.set()
+        _wait_for_release(context, observed["task_id"], observed["key"])
     finally:
+        release.set()
         if not future.done():
             future.set_result({"final_response": "late"})
+        if "key" in observed:
+            cleanup_vm(observed["key"])
+            cleanup_vm("default")
+
+
+@pytest.mark.parametrize("profile", ["default", "work"])
+@pytest.mark.parametrize("delivery_error", [False, True])
+def test_delivery_pipeline_retains_owner_through_deferred_teardown(tmp_path, monkeypatch, profile, delivery_error):
+    from cron.jobs import create_job
+
+    default, work = _homes(tmp_path, monkeypatch)
+    home = default if profile == "default" else work
+    observed = {"close_entered": Event()}
+    future = Future()
+    future.set_running_or_notify_cancel()
+    release = Event()
+    release.set()
+    _controlled_agent(monkeypatch, observed, future, False, release)
+    real_save_deliver = scheduler._save_compose_deliver
+
+    def save_deliver(*args, **kwargs):
+        observed["delivery_key"] = terminal_tool._resolve_container_task_id(observed["task_id"])
+        assert "close_key" not in observed
+        late = json.loads(terminal_tool.terminal_tool(
+            'printf %s "$CRON_LIFETIME_PROBE"', task_id=observed["task_id"]))
+        observed["delivery_output"] = late["output"]
+        if delivery_error:
+            raise RuntimeError("delivery interrupted")
+        return real_save_deliver(*args, **kwargs)
+
+    monkeypatch.setattr(scheduler, "_save_compose_deliver", save_deliver)
+    try:
+        with gateway._session_profile_runtime_scope({"profile_home": str(home)}, hydrate_secrets=False):
+            job = create_job(prompt="hello", schedule="every 1h", deliver="local")
+            scheduler._run_one_job_body(job)
+        assert observed["delivery_key"] == observed["key"]
+        assert observed["delivery_output"] == "own-run"
+        assert observed["close_key"] == observed["key"]
+        _wait_for_release(observed["context"], observed["task_id"], observed["key"])
+    finally:
+        release.set()
         if "key" in observed:
             cleanup_vm(observed["key"])
             cleanup_vm("default")

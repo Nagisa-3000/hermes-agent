@@ -12,7 +12,7 @@ from agent.delegation_context import (
 class _CronRunScope:
     """Per-run ContextVar / tool-cwd scope for ``run_job`` (ContextVars, not os.environ, so
     parallel jobs don't clobber each other). ``exit()`` restores the caller context;
-    ``release()`` drops tool ownership only after the worker and bounded cleanup complete.
+    ``release()`` drops tool ownership only after the worker and actual cleanup complete.
 
     HERMES_SESSION_* are deliberately NOT seeded from job["origin"]: it is delivery metadata, not
     a sender, and terminal/tts/skills/send_message tools would act as if the origin user were
