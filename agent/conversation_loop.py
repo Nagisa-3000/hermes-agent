@@ -1631,31 +1631,8 @@ def _run_conversation_turn(
     agent._ephemeral_reasoning_off = False
     agent._auth_pool_refresh_counts = {}
     agent._last_turn_usage = None
-    agent._deferred_completion_banner = None
-
-    # One config snapshot governs both streaming and finalization. In strict
-    # ``before_final`` mode provider token streaming is suppressed for this turn;
-    # tool-round commentary is still delivered after each non-final response is
-    # classified, while the final answer leaves only in the terminal result.
-    try:
-        from agent.background_review import background_review_timing, load_background_review_settings
-
-        _review_enabled, _review_task_cfg = load_background_review_settings()
-        _review_timing = background_review_timing(_review_task_cfg)
-    except Exception:
-        logger.warning("Failed to load background review turn settings; using background mode", exc_info=True)
-        _review_enabled, _review_task_cfg, _review_timing = True, {}, "background"
-    if (
-        not _review_enabled
-        or getattr(agent, "skip_background_review", False)
-        or getattr(agent, "_delegate_depth", 0) > 0
-    ):
-        _review_timing = "background"
-    agent._background_review_turn_settings = {
-        "enabled": bool(_review_enabled),
-        "timing": _review_timing,
-        "task_cfg": dict(_review_task_cfg),
-    }
+    from agent.background_review_timing import snapshot_turn_settings
+    snapshot_turn_settings(agent)
 
     s = _LoopState(
         system_message=system_message, moa_config=moa_config,

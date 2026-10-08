@@ -777,8 +777,6 @@ class AIAgent(
             if not enabled:
                 return
 
-        # Structural clone at the single chokepoint: the fork sanitizes in place, and a shallow copy would
-        # alias the live history's nested tool_calls/content.
         # Structural clone at the single chokepoint every review path (automatic, /refine, idle-queue
         # deferral) goes through. See #100795.
         from agent.turn_finalizer import _clone_background_review_messages
@@ -791,39 +789,7 @@ class AIAgent(
             return
         self._spawn_background_review_now(**kwargs)
 
-    def _run_background_review_before_final(
-        self, messages_snapshot: List[Dict], review_memory: bool = False,
-        review_skills: bool = False, task_cfg: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        """Run an automatic review inline before the foreground turn becomes terminal.
-
-        This path deliberately bypasses the managed-local idle queue and never creates a
-        daemon thread. The existing review worker still owns fork setup, cancellation,
-        usage accounting, summaries, and cleanup; only its lifecycle placement changes.
-        """
-        if getattr(self, "_delegate_depth", 0) > 0:
-            return
-        from agent.background_review import (
-            finish_background_review_run, prepare_background_review_run, spawn_background_review_thread,
-        )
-        from agent.turn_finalizer import _clone_background_review_messages
-
-        review_run = prepare_background_review_run(self)
-        if review_run is None:
-            return
-        try:
-            target, _prompt = spawn_background_review_thread(
-                self,
-                _clone_background_review_messages(messages_snapshot),
-                review_memory=review_memory,
-                review_skills=review_skills,
-                task_cfg=task_cfg,
-                review_run=review_run,
-            )
-            target()
-        except Exception:
-            finish_background_review_run(self, review_run)
-            raise
+    _run_background_review_before_final = _forward("agent.background_review_timing", "run_inline_review")
 
     def _spawn_background_review_now(self, messages_snapshot: List[Dict], review_memory: bool = False,
                                      review_skills: bool = False, focus: Optional[str] = None,

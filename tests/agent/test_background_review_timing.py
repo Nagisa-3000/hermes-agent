@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from agent.app_server_turn_finalization import finish_app_server_turn
+
 import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -144,7 +146,7 @@ def test_inline_review_restores_foreground_approval_callback(monkeypatch):
 def test_before_final_runs_inline_without_creating_thread(monkeypatch):
     agent = _make_agent()
     calls = []
-    run = object()
+    run = background_review._BackgroundReviewRun()
 
     monkeypatch.setattr(background_review, "prepare_background_review_run", lambda parent: run)
 
@@ -255,7 +257,7 @@ def test_app_server_strict_mode_runs_review_inline(monkeypatch):
     monkeypatch.setattr(codex_runtime, "_record_codex_app_server_compaction", lambda *_args: None)
     monkeypatch.setattr(codex_runtime, "_record_codex_app_server_usage", lambda *_args, **_kwargs: {})
 
-    result = codex_runtime._finish_codex_turn(
+    result = finish_app_server_turn(
         agent,
         turn,
         [{"role": "assistant", "content": "done"}],
@@ -307,3 +309,69 @@ def test_full_turn_snapshots_strict_timing_and_returns_only_after_review(monkeyp
     agent._interruptible_streaming_api_call.assert_not_called()
     agent._spawn_background_review.assert_not_called()
     assert agent._background_review_turn_settings is None
+
+
+@pytest.mark.parametrize("prior", ["idle", "pending", "finishes-on-cancel"])
+def test_inline_review_reports_contention_and_retries_after_ack(monkeypatch, caplog, prior):
+    agent = _make_agent()
+    previous = None if prior == "idle" else background_review.prepare_background_review_run(agent)
+    reviewed = []
+    if prior == "finishes-on-cancel":
+        class PreviousFork:
+            def hard_interrupt(self, message=None, *, tool_reason=None):
+                background_review.finish_background_review_run(agent, previous)
+        assert previous.begin_request(PreviousFork())
+    monkeypatch.setattr(background_review, "_BACKGROUND_REVIEW_CANCEL_TIMEOUT_SECONDS", 0 if prior == "pending" else 10)
+
+    def spawn(parent, snapshot, **kwargs):
+        def target():
+            reviewed.append(kwargs["review_run"])
+            background_review.finish_background_review_run(parent, kwargs["review_run"])
+        return target, "review"
+    monkeypatch.setattr(background_review, "spawn_background_review_thread", spawn)
+    try:
+        with caplog.at_level("WARNING"):
+            result = agent._run_background_review_before_final(
+                [{"role": "assistant", "content": "answer"}], review_memory=True)
+        expected = "skipped" if prior == "pending" else "ran"
+        assert isinstance(result, dict) and result["status"] == expected
+        if prior == "pending":
+            assert result["reason"] == "previous_review_still_running"
+            assert "before-final review skipped" in caplog.text.lower()
+            assert reviewed == []
+            assert agent._background_review_run is previous
+            assert previous.cancel_requested.is_set()
+        else:
+            assert len(reviewed) == 1 and reviewed[0] is not previous
+            assert agent._background_review_run is None
+    finally:
+        background_review.finish_background_review_run(agent, previous)
+
+
+@pytest.mark.parametrize("runtime", ["generic", "app-server"])
+def test_busy_inline_review_disposition_reaches_the_turn_result(monkeypatch, runtime):
+    agent = _make_agent()
+    events = []
+    _stub_for_finalize(agent, events)
+    agent._run_background_review_before_final = AIAgent._run_background_review_before_final.__get__(agent, AIAgent)
+    previous = background_review.prepare_background_review_run(agent)
+    monkeypatch.setattr(background_review, "_BACKGROUND_REVIEW_CANCEL_TIMEOUT_SECONDS", 0)
+    try:
+        if runtime == "generic":
+            result = _finalize(agent)
+            assert events == ["print:completed"]
+        else:
+            from agent import codex_runtime
+            turn = SimpleNamespace(final_text="ok", interrupted=False, tool_iterations=0, input_tokens=0,
+                output_tokens=0, cached_tokens=0, cache_creation_tokens=0, api_calls=1,
+                error=None, usage=None)
+            monkeypatch.setattr(codex_runtime, "_record_codex_app_server_usage", lambda *a, **kw: {})
+            monkeypatch.setattr(codex_runtime, "_record_codex_app_server_compaction", lambda *a: None)
+            monkeypatch.setattr(codex_runtime, "_store_codex_thread_id", lambda *a: None)
+            result = finish_app_server_turn(agent, turn, [],
+                original_user_message="test", should_review_memory=True)
+        assert result["background_review"]["status"] == "skipped"
+        assert result["background_review"]["reason"] == "previous_review_still_running"
+        agent._spawn_background_review.assert_not_called()
+    finally:
+        background_review.finish_background_review_run(agent, previous)

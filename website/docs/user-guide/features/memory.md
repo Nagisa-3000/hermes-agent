@@ -422,13 +422,19 @@ for the turn, while tool and reasoning progress can remain visible. Runtimes
 that cannot distinguish commentary from the terminal assistant message
 withhold all assistant text. Cancellation, review usage accounting, write
 controls, and review summaries use the same fork lifecycle as background mode.
-Review failure is
-fail-open: the foreground answer is still returned.
+Review failure is fail-open: the foreground answer is still returned. If a previous
+review still owns the slot, Hermes requests cancellation and waits for the existing
+bounded acknowledgement deadline, then tries to acquire a new token. If the old
+request is still running, the turn logs the skip and includes
+`background_review: {timing: before_final, status: skipped, reason: previous_review_still_running}`
+in its result. `status: ran` means the inline worker returned; `status: failed`
+reports a setup or invocation error. The old token remains owned by its worker
+until that worker acknowledges completion.
 
-Use the default `background` mode when lowest foreground latency matters more
-than a strict terminal boundary. Use `before_final` when completion must mean
-that the turn will make no further review model calls, tool calls, or durable
-memory/skill writes.
+The default `background` mode prioritizes foreground latency. `before_final`
+places this turn's admitted review behind the completion boundary. Callers that
+require a review to run can inspect the result disposition and handle a reported
+skip or failure explicitly.
 
 ### Capping review cost (`max_input_tokens`)
 

@@ -232,8 +232,8 @@ def background_review_timing(task_cfg: Optional[Dict[str, Any]] = None) -> str:
     """Return the configured review lifecycle mode.
 
     ``background`` preserves the historical daemon-thread behavior. ``before_final``
-    makes the review part of the foreground turn so no review model/tool/persistence
-    work can happen after the terminal response is exposed to the user.
+    runs an eligible review inline before the terminal response. Contention and
+    failures are reported explicitly while preserving foreground priority.
     """
     task = _background_review_task_config(task_cfg)
     raw = str(task.get("timing", "background") or "background").strip().lower()
@@ -1082,6 +1082,7 @@ def _get_thread_approval_callback() -> Any:
     try:
         return _get_approval_callback()
     except Exception:
+        logger.debug("Failed to capture foreground approval callback", exc_info=True)
         return None
 
 
