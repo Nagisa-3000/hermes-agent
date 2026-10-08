@@ -902,12 +902,7 @@ def _update_context_from(job: Dict[str, Any], a: Dict[str, Any], updates: Dict[s
 
 
 def _update_run_fields(job: Dict[str, Any], a: Dict[str, Any], updates: Dict[str, Any]) -> Optional[str]:
-    """enabled_toolsets / attach_to_session / workdir / no_agent / repeat / schedule.
-
-    Schedule edits historically re-armed every non-``paused`` job.  Keep that
-    default for compatibility, but let callers explicitly update a disabled
-    job's schedule without changing its lifecycle state.
-    """
+    """enabled_toolsets / attach_to_session / workdir / no_agent / repeat."""
     if a["enabled_toolsets"] is not None:
         # [] is an explicit zero-tool allowlist, not a clear back to the unrestricted default (#82010).
         updates["enabled_toolsets"] = a["enabled_toolsets"]
@@ -930,18 +925,13 @@ def _update_run_fields(job: Dict[str, Any], a: Dict[str, Any], updates: Dict[str
         repeat_state = dict(job.get("repeat") or {})
         repeat_state["times"] = normalize_repeat_value(a["repeat"])
         updates["repeat"] = repeat_state
-    if a["schedule"] is not None:
-        parsed_schedule = parse_schedule(a["schedule"])
-        updates["schedule"] = parsed_schedule
-        updates["schedule_display"] = parsed_schedule.get("display", a["schedule"])
-        if not a.get("preserve_lifecycle", False) and job.get("state") != "paused":
-            updates["state"] = "scheduled"
-            updates["enabled"] = True
     return None
 
 
+from tools.cronjob_tools_schedule import apply_schedule_update
+
 # Validation order is behavior (first failing field wins): keep this sequence.
-_UPDATE_STEPS = (_update_core_fields, _update_script_fields, _update_context_from, _update_run_fields)
+_UPDATE_STEPS = (_update_core_fields, _update_script_fields, _update_context_from, _update_run_fields, apply_schedule_update)
 
 
 def _action_update(job: Dict[str, Any], a: Dict[str, Any]) -> str:
@@ -1073,7 +1063,7 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
             "paused_reason": {"type": "string", "description": "Create only: auditable reason; requires paused=true."},
             "preserve_lifecycle": {
                 "type": "boolean",
-                "description": "Update only: when changing `schedule`, preserve the job's existing `enabled` and `state` instead of re-arming it. Use this when correcting schedule drift on a disabled or paused job. Default false for backwards compatibility."
+                "description": "Update only: when changing `schedule`, preserve the job's existing `enabled` and `state` instead of re-arming it. Pass a JSON boolean, not a string. This is a request option, not a stored job field. Omit or false keeps the existing re-arm behavior for non-paused jobs."
             },
             "action": {
                 "type": "string",
