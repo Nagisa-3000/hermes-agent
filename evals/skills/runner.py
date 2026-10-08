@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import sys
 from collections import defaultdict
@@ -58,10 +57,9 @@ class Metrics:
 
 def _parse_scalar(value: str) -> str:
     value = value.strip()
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\\\"'":
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
         return value[1:-1]
     return value
-
 
 def read_frontmatter(path: Path) -> dict[str, str]:
     """Read the small scalar subset needed by the metrics without new dependencies."""
@@ -147,29 +145,60 @@ def _timestamp(value: Any) -> datetime | None:
     return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
 
 
-def _creation_events(ledger_path: Path) -> tuple[int, set[str], bool]:
+def _creation_events(ledger_path: Path, cutoff: datetime, as_of: datetime) -> tuple[int, set[str], tuple[str, ...], bool]:
     events = 0
     sessions: set[str] = set()
-    malformed = False
+    warnings: set[str] = set()
+    complete = True
     try:
         lines = ledger_path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
     except OSError:
-        return 0, set(), False
+        return 0, set(), (), True
     for line in lines:
         if not line.strip():
             continue
         try:
             row = json.loads(line)
         except json.JSONDecodeError:
-            malformed = True
+            warnings.add("curator ledger contains malformed rows; valid rows only were counted")
             continue
         if not isinstance(row, dict) or row.get("action") != "create":
+            continue
+        timestamp = _timestamp(row.get("ts"))
+        if timestamp is None:
+            warnings.add("creation events with missing or invalid timestamps were excluded")
+            continue
+        if not cutoff <= timestamp <= as_of:
             continue
         events += 1
         evidence = row.get("evidence")
         if isinstance(evidence, dict) and evidence.get("session_id"):
             sessions.add(str(evidence["session_id"]))
-    return events, sessions, malformed
+        else:
+            complete = False
+            warnings.add("creation events have missing session_id values; creation rate per session is unavailable")
+    return events, sessions, tuple(sorted(warnings)), complete
+
+
+def _skill_metric_row(skill: Skill, cutoff: datetime, as_of: datetime) -> tuple[dict[str, Any], list[str]]:
+    created = _timestamp(skill.usage.get("created_at"))
+    last_used = _timestamp(skill.usage.get("last_used_at"))
+    is_mature = created is not None and created <= cutoff
+    count = skill.usage.get("use_count", 0)
+    has_uses = isinstance(count, int) and not isinstance(count, bool) and count > 0
+    # Latest-use telemetry cannot prove an earlier use when the latest is outside this window.
+    hit = bool(is_mature and has_uses and last_used and cutoff <= last_used <= as_of)
+    warnings = []
+    if created is None:
+        warnings.append(f"{skill.name}: missing or invalid created_at")
+    if has_uses and last_used is None:
+        warnings.append(f"{skill.name}: use_count is non-zero but last_used_at is missing")
+    return {
+        "name": skill.name, "path": skill.path, "class_key": skill.class_key,
+        "created_at": skill.usage.get("created_at"), "use_count": count,
+        "last_used_at": skill.usage.get("last_used_at"), "mature": is_mature,
+        "observed_trigger_within_window": hit,
+    }, warnings
 
 
 def calculate_metrics(skills_root: Path, *, usage_path: Path | None = None,
@@ -180,69 +209,40 @@ def calculate_metrics(skills_root: Path, *, usage_path: Path | None = None,
     as_of = (as_of or datetime.now(timezone.utc)).astimezone(timezone.utc)
     usage_path = usage_path or skills_root / ".usage.json"
     ledger_path = ledger_path or skills_root / ".curator_ledger.jsonl"
-    usage = _read_usage(usage_path)
-    skills = discover_skills(skills_root, usage)
+    skills = discover_skills(skills_root, _read_usage(usage_path))
     cutoff = as_of - timedelta(days=window_days)
-    mature = []
-    triggered = []
-    skill_rows: list[dict[str, Any]] = []
-    warnings: list[str] = []
-    for skill in skills:
-        created = _timestamp(skill.usage.get("created_at"))
-        last_used = _timestamp(skill.usage.get("last_used_at"))
-        is_mature = created is not None and created <= cutoff
-        # .usage.json stores counters plus the latest timestamp, not an event
-        # history.  A hit is therefore reported only when the latest observed
-        # use itself is inside the window; this is conservative and explicit.
-        hit = bool(is_mature and skill.usage.get("use_count", 0) and created and last_used
-                   and created <= last_used <= created + timedelta(days=window_days))
-        if is_mature:
-            mature.append(skill)
-            if hit:
-                triggered.append(skill)
-        if created is None:
-            warnings.append(f"{skill.name}: missing or invalid created_at")
-        if skill.usage.get("use_count", 0) and last_used is None:
-            warnings.append(f"{skill.name}: use_count is non-zero but last_used_at is missing")
-        skill_rows.append({
-            "name": skill.name,
-            "path": skill.path,
-            "class_key": skill.class_key,
-            "created_at": skill.usage.get("created_at"),
-            "use_count": skill.usage.get("use_count", 0),
-            "last_used_at": skill.usage.get("last_used_at"),
-            "mature": is_mature,
-            "observed_trigger_within_window": hit,
-        })
-
+    skill_rows = []
+    warnings = []
     classes: dict[str, list[Skill]] = defaultdict(list)
     for skill in skills:
+        row, row_warnings = _skill_metric_row(skill, cutoff, as_of)
+        skill_rows.append(row)
+        warnings.extend(row_warnings)
         classes[skill.class_key].append(skill)
+    mature = sum(row["mature"] for row in skill_rows)
+    triggered = sum(row["observed_trigger_within_window"] for row in skill_rows)
     duplicate_groups = {key: group for key, group in classes.items() if len(group) > 1}
     duplicate_skills = sum(len(group) for group in duplicate_groups.values())
-    creation_events, sessions, malformed = _creation_events(ledger_path)
-    if malformed:
-        warnings.append("curator ledger contains malformed rows; valid rows only were counted")
-    if creation_events and not sessions:
-        warnings.append("creation events have no session_id; creation rate per session is unavailable")
+    creation_events, sessions, ledger_warnings, complete = _creation_events(ledger_path, cutoff, as_of)
+    warnings.extend(ledger_warnings)
     if not ledger_path.exists():
         warnings.append("curator ledger is absent; creation rate per session is unavailable")
     if skills and not mature:
         warnings.append("no agent-created skill has aged through the measurement window")
     warnings.append("trigger precision uses latest-use telemetry; .usage.json has no per-use event history")
-    rate = creation_events / len(sessions) if sessions else None
+    rate = creation_events / len(sessions) if complete and sessions else None
     return Metrics(
         generated_at=datetime.now(timezone.utc).isoformat(), as_of=as_of.isoformat(), window_days=window_days,
         skills_root=str(skills_root), usage_path=str(usage_path), ledger_path=str(ledger_path),
-        agent_created_skills=len(skills), mature_skills=len(mature), observed_triggered_skills=len(triggered),
-        trigger_precision=(len(triggered) / len(mature)) if mature else None,
+        agent_created_skills=len(skills), mature_skills=mature, observed_triggered_skills=triggered,
+        trigger_precision=triggered / mature if mature else None,
         duplicate_class_skills=duplicate_skills, duplicate_class_groups=len(duplicate_groups),
-        duplicate_class_rate=(duplicate_skills / len(skills)) if skills else None,
+        duplicate_class_rate=duplicate_skills / len(skills) if skills else None,
         creation_events=creation_events, observed_sessions=len(sessions),
-        creation_rate_per_session=rate, session_count_source="curator ledger evidence.session_id" if sessions else "unavailable",
+        creation_rate_per_session=rate,
+        session_count_source="curator ledger evidence.session_id" if sessions else "unavailable",
         warnings=tuple(dict.fromkeys(warnings)), skills=tuple(skill_rows),
     )
-
 
 def _jsonable(metrics: Metrics) -> dict[str, Any]:
     data = asdict(metrics)
@@ -253,18 +253,22 @@ def _jsonable(metrics: Metrics) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Measure write-side skill metrics without model/API runs.")
-    default_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
-    parser.add_argument("--home", type=Path, default=default_home, help="Hermes home containing skills/")
+    parser.add_argument("--home", type=Path, help="Hermes home containing skills/ (default: active profile)")
     parser.add_argument("--window-days", type=int, default=30)
     parser.add_argument("--as-of", help="UTC ISO timestamp for reproducible reports")
     parser.add_argument("--output", type=Path, help="Write JSON report here instead of stdout")
     args = parser.parse_args(argv)
     try:
-        as_of = _timestamp(args.as_of) if args.as_of else None
+        as_of = _timestamp(args.as_of) if args.as_of is not None else None
+        if args.as_of is not None and as_of is None:
+            parser.error(f"--as-of is not a valid ISO timestamp: {args.as_of!r}")
+        if args.home is None:
+            from hermes_constants import get_hermes_home
+            args.home = get_hermes_home()
         metrics = calculate_metrics(args.home / "skills", window_days=args.window_days, as_of=as_of)
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
-    payload = json.dumps(_jsonable(metrics), ensure_ascii=False, indent=2) + "\\n"
+    payload = json.dumps(_jsonable(metrics), ensure_ascii=False, indent=2) + "\n"
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(payload, encoding="utf-8")

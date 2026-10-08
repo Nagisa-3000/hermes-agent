@@ -13,6 +13,9 @@ python evals/skills/runner.py --home ~/.hermes --window-days 30 \
   --output evals/skills/results/arm-a.json
 ```
 
+`--as-of` must be a valid ISO date/time; invalid values fail before a report is
+written. Without `--home`, an installed Hermes runtime resolves the active profile.
+
 The runner reads only:
 
 - `~/.hermes/skills/.usage.json` for provenance and use counters;
@@ -27,11 +30,14 @@ own output. This keeps the measurement independent of the system it measures.
 ## Metrics
 
 - **Creation rate per session**: create ledger events divided by distinct
-  session IDs. It is `null` when the ledger is unavailable or creation entries
-  do not carry session IDs; a fabricated denominator is worse than a missing
+  session IDs in the inclusive report window `[as_of - window_days, as_of]`.
+  Missing or invalid event timestamps are excluded with a warning. The rate is
+  `null` when the ledger is unavailable or any counted creation entry lacks a
+  session ID; a fabricated denominator is worse than a missing
   number.
 - **Trigger precision**: the fraction of agent-created skills old enough to
-  have completed the requested window that have a recorded use in that window.
+  have completed the requested window that have a positive use count and a latest
+  recorded use in that report window, including both boundaries.
   The current usage sidecar stores only `last_used_at`, not a use-event history,
   so the runner reports a hit only when the latest observed use is inside the
   window. The report includes this limitation as a warning.
@@ -43,3 +49,5 @@ own output. This keeps the measurement independent of the system it measures.
 Every skill row is included in the JSON report so a maintainer can audit a
 summary back to the source files. The report is intentionally data-only: no
 archive/delete/promotion action is taken from a score.
+
+Run the evaluator coverage with `scripts/run_tests.sh tests/evals/test_skill_write_metrics.py`.
