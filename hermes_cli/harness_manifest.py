@@ -14,6 +14,7 @@ import copy
 import hashlib
 import json
 import logging
+import math
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -91,7 +92,9 @@ def manifest_signature(home: Path | None = None) -> tuple[int, int, int, int]:
         stat_result = manifest_path(home).stat()
     except OSError:
         return (0, 0, 0, 0)
-    return file_signature(stat_result)
+    # The same manifest becomes inert when the running stock changes, even if no file changed.
+    digest = hashlib.sha256(repr((file_signature(stat_result), stock_revision())).encode()).digest()
+    return tuple(int.from_bytes(digest[offset:offset + 8], "big") for offset in range(0, 32, 8))
 
 
 def stock_revision() -> str:
@@ -101,7 +104,8 @@ def stock_revision() -> str:
 
         info = get_version_info()
         return info.commit or info.derived_version or "unknown"
-    except Exception:  # pragma: no cover - defensive for early bootstrap/install failures
+    except Exception:  # pragma: no cover - early bootstrap/install failures
+        logger.debug("Cannot resolve stock revision", exc_info=True)
         return "unknown"
 
 
@@ -124,6 +128,8 @@ def _now() -> str:
 
 
 def _coerce_value(entry: HarnessKey, value: Any) -> Any:
+    if value is None and entry.path == "agent.max_turns":
+        return None
     if entry.value_type == "integer":
         if isinstance(value, bool) or not isinstance(value, int):
             raise HarnessManifestError(f"{entry.path} expects an integer")
@@ -131,8 +137,8 @@ def _coerce_value(entry: HarnessKey, value: Any) -> Any:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise HarnessManifestError(f"{entry.path} expects a number")
         value = float(value)
-    if value is None and entry.path == "agent.max_turns":
-        return None
+        if not math.isfinite(value):
+            raise HarnessManifestError(f"{entry.path} must be finite")
     if value is None:
         raise HarnessManifestError(f"{entry.path} cannot be null")
     if entry.minimum is not None and value < entry.minimum:
@@ -150,7 +156,37 @@ def _validate_name(value: Any, label: str) -> str:
     return value
 
 
-def _validate_manifest(raw: Any) -> dict[str, Any]:
+def _normalize_overlay(item: Any, index: int, revision: str, seen: set[str]) -> dict[str, Any]:
+    if not isinstance(item, dict):
+        raise HarnessManifestError(f"overlay {index} must be a mapping")
+    overlay_id = _validate_name(item.get("id"), f"overlay {index}.id")
+    if overlay_id in seen:
+        raise HarnessManifestError(f"duplicate overlay id {overlay_id!r}")
+    name = _validate_name(item.get("name", overlay_id), f"overlay {index}.name")
+    reason = item.get("reason", "")
+    authored_against = item.get("authored_against", revision)
+    created_at = item.get("created_at", "")
+    if not isinstance(reason, str) or len(reason) > 2000:
+        raise HarnessManifestError(f"overlay {overlay_id!r}.reason must be a string <= 2000 chars")
+    if not isinstance(authored_against, str) or not authored_against:
+        raise HarnessManifestError(f"overlay {overlay_id!r}.authored_against must be a string")
+    if not isinstance(created_at, str):
+        raise HarnessManifestError(f"overlay {overlay_id!r}.created_at must be a string")
+    values = item.get("values", {})
+    if not isinstance(values, dict) or not values:
+        raise HarnessManifestError(f"overlay {overlay_id!r}.values must be a non-empty mapping")
+    clean_values: dict[str, Any] = {}
+    for path, value in values.items():
+        if not isinstance(path, str):
+            raise HarnessManifestError(f"overlay {overlay_id!r} contains a non-string key")
+        clean_values[path] = _coerce_value(registry_entry(path), value)
+    return {
+        "id": overlay_id, "name": name, "reason": reason,
+        "authored_against": authored_against, "created_at": created_at, "values": clean_values,
+    }
+
+
+def _validate_manifest(raw: Any, *, skip_invalid_layers: bool = False) -> dict[str, Any]:
     if raw is None:
         return {"schema_version": SCHEMA_VERSION, "stock_revision": stock_revision(), "overlays": []}
     if not isinstance(raw, dict):
@@ -168,42 +204,19 @@ def _validate_manifest(raw: Any) -> dict[str, Any]:
     normalized: list[dict[str, Any]] = []
     seen: set[str] = set()
     for index, item in enumerate(overlays):
-        if not isinstance(item, dict):
-            raise HarnessManifestError(f"overlay {index} must be a mapping")
-        overlay_id = _validate_name(item.get("id"), f"overlay {index}.id")
-        if overlay_id in seen:
-            raise HarnessManifestError(f"duplicate overlay id {overlay_id!r}")
-        seen.add(overlay_id)
-        name = _validate_name(item.get("name", overlay_id), f"overlay {index}.name")
-        reason = item.get("reason", "")
-        authored_against = item.get("authored_against", revision)
-        created_at = item.get("created_at", "")
-        if not isinstance(reason, str) or len(reason) > 2000:
-            raise HarnessManifestError(f"overlay {overlay_id!r}.reason must be a string <= 2000 chars")
-        if not isinstance(authored_against, str) or not authored_against:
-            raise HarnessManifestError(f"overlay {overlay_id!r}.authored_against must be a string")
-        if not isinstance(created_at, str):
-            raise HarnessManifestError(f"overlay {overlay_id!r}.created_at must be a string")
-        values = item.get("values", {})
-        if not isinstance(values, dict) or not values:
-            raise HarnessManifestError(f"overlay {overlay_id!r}.values must be a non-empty mapping")
-        clean_values: dict[str, Any] = {}
-        for path, value in values.items():
-            if not isinstance(path, str):
-                raise HarnessManifestError(f"overlay {overlay_id!r} contains a non-string key")
-            clean_values[path] = _coerce_value(registry_entry(path), value)
-        normalized.append({
-            "id": overlay_id,
-            "name": name,
-            "reason": reason,
-            "authored_against": authored_against,
-            "created_at": created_at,
-            "values": clean_values,
-        })
+        try:
+            overlay = _normalize_overlay(item, index, revision, seen)
+        except HarnessManifestError as exc:
+            if not skip_invalid_layers:
+                raise
+            logger.warning("Ignoring invalid harness layer %s: %s", index, exc)
+            continue
+        seen.add(overlay["id"])
+        normalized.append(overlay)
     return {"schema_version": SCHEMA_VERSION, "stock_revision": revision, "overlays": normalized}
 
 
-def load_manifest(path: Path | None = None) -> dict[str, Any]:
+def load_manifest(path: Path | None = None, *, skip_invalid_layers: bool = False) -> dict[str, Any]:
     path = path or manifest_path()
     try:
         with path.open(encoding="utf-8-sig") as handle:
@@ -214,7 +227,7 @@ def load_manifest(path: Path | None = None) -> dict[str, Any]:
         raise HarnessManifestError(f"cannot read {path}: {exc}") from exc
     except Exception as exc:
         raise HarnessManifestError(f"cannot parse {path}: {exc}") from exc
-    return _validate_manifest(raw)
+    return _validate_manifest(raw, skip_invalid_layers=skip_invalid_layers)
 
 
 def save_manifest(manifest: dict[str, Any], path: Path | None = None) -> None:
@@ -240,12 +253,11 @@ def active_values(manifest: dict[str, Any], revision: str | None = None) -> dict
 def apply_active_overlays(config: dict[str, Any], *, path: Path | None = None) -> dict[str, Any]:
     """Apply valid current-revision overlays, leaving stale overlays inert.
 
-    Invalid user-authored manifests are ignored by the runtime (with a warning); a bad optional
-    tuning file must not prevent Hermes from starting. The CLI remains strict and reports the
-    exact validation error so the operator can repair or revert it.
+    Invalid layers are skipped individually with a warning; invalid envelopes leave the entire
+    manifest inert. The CLI remains strict so edits cannot silently discard malformed layers.
     """
     try:
-        manifest = load_manifest(path)
+        manifest = load_manifest(path, skip_invalid_layers=True)
     except HarnessManifestError as exc:
         logger.warning("Ignoring invalid harness manifest: %s", exc)
         return config
@@ -380,7 +392,7 @@ def show_state(manifest: dict[str, Any] | None = None, revision: str | None = No
 def parse_cli_value(text: str) -> Any:
     try:
         value = yaml.safe_load(text)
-    except Exception:
+    except yaml.YAMLError:
         value = text
     return text if value is None and text.strip().lower() not in {"null", "~"} else value
 

@@ -66,7 +66,8 @@ def load_user_config_effective(config_path: Optional[Path] = None, *, fail_close
         config_path = _config.get_config_path()
     path_key = str(config_path)
     with _config._CONFIG_LOCK:
-        user_sig, cache_sig = _config._load_config_cache_sig(config_path)
+        from hermes_cli.config_load_sources import load_config_cache_signature
+        user_sig, cache_sig = load_config_cache_signature(config_path)
         cached = _EFFECTIVE_CACHE.get(path_key)
         if cached is not None and cache_sig is not None and cached[:len(cache_sig)] == cache_sig:
             if all(_config._env_ref_lookup(k) == v for k, v in cached[len(cache_sig) + 1].items()):
