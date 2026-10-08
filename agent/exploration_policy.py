@@ -373,6 +373,20 @@ def _tool_call_count(value: Any) -> int:
     return len(_TOOL_CALL_RE.findall(value))
 
 
+def _recorded_decisions(trajectory: Sequence[Mapping[str, Any]]):
+    # Hash the same JSON-list bytes incrementally so capture stays linear in history size.
+    prefix = hashlib.sha256(b"[")
+    for index, message in enumerate(trajectory):
+        if message.get("from") == "gpt":
+            state = prefix.copy()
+            state.update(b"]")
+            yield message, state.hexdigest()
+        if index:
+            prefix.update(b",")
+        payload = json.dumps(message, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
+        prefix.update(payload.encode("utf-8"))
+
+
 def build_exploration_tree(
     trajectory: Sequence[Mapping[str, Any]],
     *,
@@ -386,20 +400,15 @@ def build_exploration_tree(
     out of support during replay.  Richer branch instrumentation can add sibling branches later
     without changing the replay contract.
     """
-    decisions = [
-        (index, message)
-        for index, message in enumerate(trajectory)
-        if message.get("from") == "gpt"
-    ]
+    decisions = list(_recorded_decisions(trajectory))
     events = []
-    for ordinal, (index, message) in enumerate(decisions):
+    for ordinal, (message, state_digest) in enumerate(decisions):
         value = message.get("value", "")
         has_tool_calls = _tool_call_count(value) > 0
         chosen_action = "continue" if has_tool_calls else "stop"
         terminal = ordinal == len(decisions) - 1
         child_ids = (f"decision-{ordinal + 1}",) if not terminal else ()
         score = (1.0 if completed else 0.0) if terminal else None
-        state_digest = _stable_digest(list(trajectory[:index]))
         events.append(
             ExplorationEvent(
                 decision_id=f"decision-{ordinal}",

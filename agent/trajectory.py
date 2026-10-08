@@ -64,7 +64,7 @@ def save_exploration_tree(tree: ExplorationTree, filename: str) -> None:
     except Exception as exc:
         # Exploration capture is secondary telemetry and must never turn a completed agent run into
         # a failed run when a secondary artifact cannot be written.
-        logger.warning("Failed to save exploration tree: %s", exc)
+        logger.warning("Failed to save exploration tree: %s", exc, exc_info=True)
 
 
 def save_trajectory(
@@ -87,9 +87,12 @@ def save_trajectory(
         _append_jsonl(entry, filename)
         logger.info("Trajectory saved to %s", filename)
     except Exception as exc:
-        logger.warning("Failed to save trajectory: %s", exc)
+        logger.warning("Failed to save trajectory: %s", exc, exc_info=True)
         return
 
-    tree = build_exploration_tree(trajectory, completed=completed)
-    save_exploration_tree(tree, exploration_filename or _exploration_filename(filename, completed))
+    try:
+        tree = build_exploration_tree(trajectory, completed=completed)
+        save_exploration_tree(tree, exploration_filename or _exploration_filename(filename, completed))
+    except Exception as exc:
+        logger.warning("Failed to capture exploration tree: %s", exc, exc_info=True)
 
