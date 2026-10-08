@@ -307,7 +307,7 @@ def test_shared_key_ignored_outside_persistent_docker(monkeypatch):
 def _new_cron_scope(job_id: str, execution_id: str):
     """Construct a run in its own Context, matching concurrent scheduler workers."""
     from contextvars import Context
-    from cron.scheduler import _CronRunScope
+    from cron.scheduler_run_scope import _CronRunScope
 
     context = Context()
     scope = context.run(_CronRunScope, {"id": job_id}, job_id, execution_id)
@@ -331,7 +331,9 @@ def test_local_cron_runs_own_distinct_terminal_environments(monkeypatch):
         assert first_key != second_key
     finally:
         first_ctx.run(first.exit)
+        first_ctx.run(first.release)
         second_ctx.run(second.exit)
+        second_ctx.run(second.release)
 
 
 def test_local_cron_delegate_uses_parent_run_environment(monkeypatch):
@@ -349,6 +351,7 @@ def test_local_cron_delegate_uses_parent_run_environment(monkeypatch):
     finally:
         terminal_tool.clear_task_env_overrides(child)
         context.run(scope.exit)
+        context.run(scope.release)
 
 
 def test_persistent_docker_cron_keeps_profile_container_scope(monkeypatch):
@@ -361,6 +364,7 @@ def test_persistent_docker_cron_keeps_profile_container_scope(monkeypatch):
         ) == "default"
     finally:
         context.run(scope.exit)
+        context.run(scope.release)
 
 
 def test_cron_scope_release_restores_sessionless_default(monkeypatch):
@@ -369,6 +373,7 @@ def test_cron_scope_release_restores_sessionless_default(monkeypatch):
     context, scope = _new_cron_scope("job-a", "run-1")
     task_id = scope.task_id
     context.run(scope.exit)
+    context.run(scope.release)
     assert terminal_tool._resolve_container_task_id(task_id) == "default"
 
 
@@ -409,4 +414,6 @@ def test_local_cron_runs_do_not_share_exported_variables(tmp_path, monkeypatch):
         first_ctx.run(cleanup_vm, first.task_id)
         second_ctx.run(cleanup_vm, second.task_id)
         first_ctx.run(first.exit)
+        first_ctx.run(first.release)
         second_ctx.run(second.exit)
+        second_ctx.run(second.release)

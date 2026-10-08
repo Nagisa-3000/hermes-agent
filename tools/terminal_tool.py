@@ -383,25 +383,21 @@ def register_run_scoped_task(task_id: str) -> None:
     if not task_id:
         return
     with _container_alias_lock:
-        _run_scoped_tasks.add(task_id)
+        _run_scoped_tasks.add(_qualify_task_key(task_id))
 
 
 def clear_run_scoped_task(task_id: str) -> None:
     """Release the local terminal ownership marker for a completed run."""
     with _container_alias_lock:
-        _run_scoped_tasks.discard(task_id)
+        _run_scoped_tasks.discard(_qualify_task_key(task_id))
 
 
 def _run_scoped_owner(task_id: Optional[str]) -> Optional[str]:
     """Return the registered run owning *task_id*, following delegate aliases."""
     if not task_id:
         return None
-    seen = set()
-    key = task_id
+    key = _qualify_task_key(_resolve_container_alias(task_id))
     with _container_alias_lock:
-        while key in _container_aliases and key not in seen:
-            seen.add(key)
-            key = _container_aliases[key]
         return key if key in _run_scoped_tasks else None
 
 
