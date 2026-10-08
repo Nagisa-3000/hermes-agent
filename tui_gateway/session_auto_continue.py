@@ -470,6 +470,13 @@ def _drain_queued_prompt(rid, sid: str, session: dict) -> bool:
     with _session_turn_admission(session) as admitted:
         if not admitted or session.get("_closing") or not (queued := session.get("queued_prompt")) or session.get("running"):
             return False
+        try:
+            _assert_session_profile_ownership(session)
+        except SessionProfileOwnershipError as exc:
+            logger.warning("queued prompt refused session profile ownership: %s", exc)
+            # Leave the envelope intact: ownership must be restored before it can be dispatched.
+            _emit("error", sid, {"message": _session_profile_ownership_error_message(exc)})
+            return True
         queue_generation = int(session.get("_queued_prompt_generation", 0))
         _ac_set_queue(session, session.get("queued_prompts") or [])
         session["running"] = True

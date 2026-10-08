@@ -1,226 +1,114 @@
-"""Cross-profile session ids must never be materialized in the launch store."""
+"""Session ownership must survive cold discovery and refusals must reach the client."""
 
 from __future__ import annotations
 
-import importlib
 import threading
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from types import SimpleNamespace
 
 import pytest
 
 from hermes_state import SessionDB
 
-SESSION_KEY = "20260101_000000_deadbe"
+KEY = "20260101_000000_deadbe"
 
 
-@pytest.fixture()
-def server():
-    with patch.dict(
-        "sys.modules",
-        {
-            "hermes_cli.env_loader": MagicMock(),
-            "hermes_cli.banner": MagicMock(),
-        },
-    ):
-        mod = importlib.import_module("tui_gateway.server")
-    yield mod
-    mod._sessions.clear()
-    mod._served_profile_homes.clear()
-    mod._db = None
-
-
-@pytest.fixture()
-def stores(tmp_path, monkeypatch, server):
-    launch_home = tmp_path / "launch"
-    profile_home = tmp_path / "profiles" / "bot"
-    launch_home.mkdir(parents=True)
-    profile_home.mkdir(parents=True)
-
-    launch_db = SessionDB(db_path=launch_home / "state.db")
-    profile_db = SessionDB(db_path=profile_home / "state.db")
-    profile_db.create_session(SESSION_KEY, source="desktop")
-
-    monkeypatch.setattr(server, "_get_db", lambda: launch_db)
-    monkeypatch.setattr(server, "_db_error", None)
-    monkeypatch.setattr(server, "_served_profile_homes", {profile_home})
-    monkeypatch.setattr(server, "_current_profile_name", lambda: "default")
-
-    yield launch_db, profile_home, profile_db
-
-    profile_db.close()
-    launch_db.close()
-
-
-def test_launch_write_is_refused_when_a_served_profile_owns_the_id(server, stores):
-    launch_db, _, profile_db = stores
-
-    with pytest.raises(server.SessionProfileOwnershipError):
-        server._ensure_session_db_row({"session_key": SESSION_KEY, "source": "desktop"})
-
-    assert launch_db.get_session(SESSION_KEY) is None
-    assert profile_db.get_session(SESSION_KEY) is not None
-
-
-def test_launch_write_still_lands_for_a_genuinely_local_session(server, stores):
-    launch_db, _, _ = stores
-
-    ok = server._ensure_session_db_row({"session_key": "local-session-1", "source": "desktop"})
-
-    assert ok is True
-    assert launch_db.get_session("local-session-1") is not None
-
-
-def test_profile_scoped_session_never_writes_or_probes_the_launch_store(server, stores, tmp_path, monkeypatch):
-    launch_db, profile_home, profile_db = stores
-    unreadable_home = tmp_path / "profiles" / "unreadable"
-    unreadable_home.mkdir(parents=True)
-    (unreadable_home / "state.db").write_bytes(b"not sqlite")
-    monkeypatch.setattr(server, "_served_profile_homes", {profile_home, unreadable_home})
-
-    ok = server._ensure_session_db_row(
-        {"session_key": SESSION_KEY, "profile_home": str(profile_home), "source": "desktop"}
-    )
-
-    assert ok is True
-    assert profile_db.get_session(SESSION_KEY) is not None
-    assert launch_db.get_session(SESSION_KEY) is None
-
-
-def test_single_profile_install_keeps_the_launch_store_path(server, stores, monkeypatch):
-    launch_db, _, _ = stores
+@pytest.fixture
+def stores(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    launch = tmp_path / ".hermes"
+    homes = [launch, launch / "profiles" / "bot", launch / "profiles" / "other"]
+    for home in homes:
+        home.mkdir(parents=True, exist_ok=True)
+        (home / "config.yaml").write_text("terminal:\n  backend: local\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(launch))
+    from tui_gateway import server
+    monkeypatch.setattr(server, "_hermes_home", launch)
     monkeypatch.setattr(server, "_served_profile_homes", set())
-    import hermes_state
-    monkeypatch.setattr(hermes_state, "SessionDB", MagicMock(side_effect=AssertionError("sibling probe")))
-
-    ok = server._ensure_session_db_row({"session_key": SESSION_KEY, "source": "desktop"})
-
-    assert ok is True
-    assert launch_db.get_session(SESSION_KEY) is not None
-
-
-def test_unstatable_served_store_fails_closed(server, stores, tmp_path, monkeypatch):
-    launch_db, _, _ = stores
-    blocked_home = tmp_path / "profiles" / "blocked"
-    blocked_home.mkdir(parents=True)
-    blocked_db = blocked_home / "state.db"
-    blocked_db.write_bytes(b"sqlite placeholder")
-    monkeypatch.setattr(server, "_served_profile_homes", {blocked_home})
-
-    original_stat = Path.stat
-
-    def guarded_stat(path, *args, **kwargs):
-        if path == blocked_db:
-            raise PermissionError("profile store metadata denied")
-        return original_stat(path, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "stat", guarded_stat)
-
-    with pytest.raises(server.SessionProfileOwnershipError) as raised:
-        server._ensure_session_db_row({"session_key": "unverified-session", "source": "desktop"})
-
-    assert raised.value.probe_failed is True
-    assert launch_db.get_session("unverified-session") is None
+    monkeypatch.setattr(server, "_db_error", None)
+    monkeypatch.setattr(server, "_current_profile_name", lambda: "default")
+    dbs = [SessionDB(db_path=home / "state.db") for home in homes]
+    monkeypatch.setattr(server, "_get_db", lambda: dbs[0])
+    dbs[1].create_session(KEY, source="desktop")
+    yield server, homes, dbs
+    for db in reversed(dbs):
+        db.close()
+    server._sessions.clear()
 
 
-def test_unreadable_served_store_fails_closed(server, stores, tmp_path, monkeypatch):
-    launch_db, profile_home, _ = stores
-    unreadable_home = tmp_path / "profiles" / "unreadable"
-    unreadable_home.mkdir(parents=True)
-    (unreadable_home / "state.db").write_bytes(b"not sqlite")
-    monkeypatch.setattr(server, "_served_profile_homes", {profile_home, unreadable_home})
-
-    with pytest.raises(server.SessionProfileOwnershipError) as raised:
-        server._ensure_session_db_row({"session_key": "unverified-session", "source": "desktop"})
-
-    assert raised.value.probe_failed is True
-    assert launch_db.get_session("unverified-session") is None
-
-
-def test_profile_scope_alternation_keeps_each_store_isolated(server, stores):
-    launch_db, profile_home, profile_db = stores
-
-    assert server._ensure_session_db_row({"session_key": "launch-a", "source": "desktop"}) is True
-    assert server._ensure_session_db_row(
-        {"session_key": "profile-b", "profile_home": str(profile_home), "source": "desktop"}
-    ) is True
-    assert server._ensure_session_db_row({"session_key": "launch-c", "source": "desktop"}) is True
-
-    assert launch_db.get_session("launch-a") is not None
-    assert launch_db.get_session("launch-c") is not None
-    assert launch_db.get_session("profile-b") is None
-    assert profile_db.get_session("profile-b") is not None
-    assert profile_db.get_session("launch-a") is None
-    assert profile_db.get_session("launch-c") is None
-
-
-def test_foreign_owner_blocks_synthesized_turn_before_admission_and_releases_claim(
-    server, stores, monkeypatch
-):
-    launch_db, _, _ = stores
-    admitted = MagicMock(return_value=None)
-    monkeypatch.setattr(server, "_admit_prompt_turn", admitted)
-
-    class Lease:
-        track_liveness = False
-        enabled = True
-        released = False
-
-        def release(self):
-            self.released = True
-
-    lease = Lease()
-    session = {
-        "session_key": SESSION_KEY,
-        "source": "desktop",
-        "running": True,
-        "history_lock": threading.RLock(),
-        "inflight_turn": {"user": "private prompt", "status": "streaming"},
-        "_submit_user_row": 42,
-        "_hosted_room_task": {"id": "task-1"},
-        "_auto_continue_scheduled": True,
-        "_auto_continue_attempt": 2,
-        "_auto_continue_prompt": "private prompt",
-        "active_session_lease": lease,
-    }
-
-    started = server._run_prompt_submit(
-        "request-1", "ui-session", session, "private prompt"
-    )
-
-    assert started is False
-    admitted.assert_not_called()
-    assert session["running"] is False
-    assert session["inflight_turn"] is None
-    assert "_submit_user_row" not in session
-    assert "_hosted_room_task" not in session
-    assert "_auto_continue_scheduled" not in session
-    assert "_auto_continue_attempt" not in session
-    assert "_auto_continue_prompt" not in session
-    assert "active_session_lease" not in session
-    assert lease.released is True
-    assert session["last_active"] > 0
-    assert launch_db.get_session(SESSION_KEY) is None
+@pytest.mark.parametrize("cached,key,local_exists,unavailable,explicit,allowed", [
+    pytest.param((), KEY, False, False, False, False, id="cold"),
+    pytest.param((2,), KEY, False, False, False, False, id="partial"),
+    pytest.param((1,), KEY, False, False, False, False, id="discovered"),
+    pytest.param((), KEY, True, False, False, False, id="ambiguous"),
+    pytest.param((), "unverified-local", False, True, False, False, id="unavailable"),
+    pytest.param((), "local-session", False, False, False, True, id="new-local"),
+    pytest.param((), "local-session", True, False, False, True, id="existing-local"),
+    pytest.param((), KEY, False, False, True, True, id="explicit"),
+])
+def test_durable_ownership_is_independent_of_process_discovery(
+        stores, cached, key, local_exists, unavailable, explicit, allowed):
+    server, homes, dbs = stores
+    server._served_profile_homes.update(homes[index] for index in cached)
+    if local_exists:
+        dbs[0].create_session(key, source="desktop")
+    if unavailable:
+        dbs[2].close()
+        (homes[2] / "state.db").write_bytes(b"not a sqlite database")
+    session = {"session_key": key, "source": "desktop"}
+    if explicit:
+        session["profile_home"] = str(homes[1])
+    if allowed:
+        assert server._ensure_session_db_row(session) is True
+        frame = server._compute_host_turn_frame("request", "ui", {**session, "history_lock": threading.RLock()}, "hello")
+        assert Path(frame["profile_home"]) == homes[1 if explicit else 0]
+    else:
+        with pytest.raises(server.SessionProfileOwnershipError):
+            server._ensure_session_db_row(session)
+    assert (dbs[0].get_session(key) is not None) == (local_exists or (allowed and not explicit))
+    assert dbs[1].get_session(KEY) is not None
 
 
-def test_foreign_owner_rejects_busy_queue_without_retaining_prompt(server, stores, monkeypatch):
-    launch_db, _, _ = stores
-    session = {
-        "session_key": SESSION_KEY,
-        "source": "desktop",
-        "running": True,
-        "history_lock": threading.RLock(),
-        "attached_images": [],
-        "agent": None,
-    }
+@pytest.mark.parametrize("entry", ["submit", "busy", "synthetic", "queue", "compute"])
+def test_profile_refusal_has_an_observable_disposition(stores, monkeypatch, entry):
+    server, homes, dbs = stores
+    server._served_profile_homes.add(homes[1])
+    events, dispatched = [], []
+    monkeypatch.setattr(server, "_emit", lambda name, sid, payload=None: events.append((name, payload)))
+    monkeypatch.setattr(server, "_admit_prompt_turn", lambda *a, **kw: dispatched.append("agent"))
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda session, cfg=None: False)
     monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
-    monkeypatch.setattr(server, "_session_compression_in_flight", lambda _session: False)
-    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: False)
-
-    response = server._handle_busy_submit(
-        "request-2", "ui-session", session, "private queued prompt", transport=None
-    )
-
-    assert response.get("error")
-    assert not session.get("queued_prompt")
-    assert launch_db.get_session(SESSION_KEY) is None
+    monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda cfg: SimpleNamespace(
+        submit_turn=lambda frame, **kw: dispatched.append("compute")))
+    session = {"session_key": KEY, "source": "desktop", "running": True, "agent": None,
+               "history_lock": threading.RLock(), "attached_images": [], "history": [],
+               "queued_prompts": [], "_queued_prompt_generation": 0,
+               "inflight_turn": {"user": "hello", "assistant": "", "streaming": True}}
+    server._sessions["ui"] = session
+    calls = {
+        "submit": lambda: server.handle_request({"id": "request", "method": "prompt.submit",
+                    "params": {"session_id": "ui", "text": "hello"}}),
+        "busy": lambda: server._handle_busy_submit("request", "ui", session, "hello", transport=None),
+        "synthetic": lambda: server._run_prompt_submit("request", "ui", session, "hello"),
+        "queue": lambda: server._drain_queued_prompt("request", "ui", session),
+        "compute": lambda: server._submit_prompt_to_compute_host("request", "ui", session, "hello"),
+    }
+    if entry in {"queue", "submit"}:
+        session["running"] = False
+    if entry == "queue":
+        session["queued_prompt"] = {"text": "hello"}
+    response = calls[entry]()
+    if isinstance(response, dict):
+        assert response["error"]["code"] == 4095
+    else:
+        assert response is (entry == "queue")
+        assert not session["running"]
+        assert any(name in {"message.complete", "error"} for name, payload in events)
+    if entry == "synthetic":
+        assert server._inflight_snapshot(session)["status"] == "error"
+    if entry == "queue":
+        assert session["queued_prompt"]["text"] == "hello"
+    if entry == "busy":
+        assert not session.get("queued_prompt")
+    assert dispatched == []
+    assert dbs[0].get_session(KEY) is None
