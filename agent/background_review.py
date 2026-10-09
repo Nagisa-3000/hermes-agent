@@ -393,13 +393,6 @@ _LESSON_LAYER_BLOCK = (
     "  • A pitfall is a generalizable rule + one clause of WHY (the mechanism), imperative. 'Grep the "
     "test tree for the SYMBOL before widening a helper signature — hand-rolled mocks reimplement the "
     "old shape and fail on a shard you did not run.' Not a narrative of what happened this session.\n"
-    "  • Verified procedures only: before recording a method as working, find independent "
-    "verification of its relevant final result in the transcript — an explicit user confirmation, "
-    "a tool/test result checking the expected final state, or a re-query of the external system. "
-    "The assistant's own 'done' or 'verified' claim, lack of exceptions, and checks of earlier or "
-    "partial steps are not proof of the final outcome. Without that evidence, do not save the "
-    "procedure as successful or recommended; 'Nothing to save.' is appropriate. Explicit user "
-    "preferences and corrections may still be saved without a successful task outcome.\n"
     "  • Separate instance details from decision constants. Drop incidental PR/issue numbers, "
     "ticket IDs, names, dates, and quoted chat — the rule must stand without the incident. Keep "
     "the exact labels, categories, enum values, field names, and thresholds that the procedure "
@@ -440,21 +433,22 @@ _DO_NOT_CAPTURE_BLOCK = (
     "tried several things, none worked, and told the user to check manually — do NOT write those "
     "attempts up as a 'reliable workflow' or 'recommended approach'. That presents an untested "
     "sequence of failures as validated guidance a future session will trust and repeat. Either say "
-    "'Nothing to save', or capture ONLY an alternative whose result was independently verified in "
-    "the transcript. Confidence in an untested alternative is not verification. Never present "
-    "dead ends as best practice.\n\n"
+    "'Nothing to save', or, only if you are independently confident of a real working alternative "
+    "(not something you are merely guessing might work), capture ONLY that alternative — never the "
+    "dead ends, and never dressed up as best practice.\n\n"
     "If a tool failed because of setup state, capture the FIX (install command, config step, env "
     "var to set) under an existing setup or troubleshooting skill — never 'this tool does not "
     "work' as a standalone constraint.\n\n"
 )
 
 _SKILL_REVIEW_PROMPT = (
-    "Review the conversation above for verified procedural learning and explicit user "
-    "preferences or corrections. Update the skill library when there is durable evidence; "
-    "do not invent an update to meet a quota.\n\n"
+    "Review the conversation above and update the skill library. Be ACTIVE — most sessions produce "
+    "at least one skill update, even if small. A pass that does nothing is a missed learning "
+    "opportunity, not a neutral outcome.\n\n"
     "Target shape of the library: CLASS-LEVEL skills, each with a SKILL.md of always-on rules and a "
     "small `references/` set of topical depth. Not a flat list of narrow one-session skills, and "
-    "not an umbrella hoarding a references/ file per session.\n\n" + _LESSON_LAYER_BLOCK +
+    "not an umbrella hoarding a references/ file per session. This shapes HOW you update, not "
+    "WHETHER you update.\n\n" + _LESSON_LAYER_BLOCK +
     "Signals to look for (any one of these warrants action):\n"
     "  • User corrected your style, tone, format, legibility, or verbosity. Frustration signals "
     "like 'stop doing X', 'this is too verbose', 'don't format like this', 'why are you "
@@ -464,8 +458,7 @@ _SKILL_REVIEW_PROMPT = (
     "  • User corrected your workflow, approach, or sequence of steps. Encode the correction as a "
     "pitfall or explicit step in the skill that governs that class of task.\n"
     "  • Non-trivial technique, fix, workaround, debugging path, or tool-usage pattern emerged "
-    "that a future session would benefit from, with independent verification of its result. "
-    "Capture the verified method.\n"
+    "that a future session would benefit from. Capture it.\n"
     "  • A skill that got loaded or consulted this session turned out to be wrong, missing a step, "
     "or outdated. Patch it NOW.\n\n"
     "Preference order — prefer the earliest action that fits, but do pick one when a signal above "
@@ -514,15 +507,17 @@ _SKILL_REVIEW_PROMPT = (
     "If you notice two existing skills that overlap, note it in your reply — the background "
     "curator handles consolidation at scale. Never delete a skill here.\n\n"
     "Do NOT capture" + _DO_NOT_CAPTURE_BLOCK +
-    "If there is no verified procedural learning or explicit user preference/correction to save, "
-    "say 'Nothing to save.' and stop. A session that looked complete is not evidence by itself."
+    "'Nothing to save.' is a real option but should NOT be the default. If the session ran "
+    "smoothly with no corrections and produced no new technique, just say 'Nothing to save.' and "
+    "stop. Otherwise, act."
 )
 
 _COMBINED_REVIEW_PROMPT = (
     "Review the conversation above and update two things:\n\n"
     "**Memory**: " + _MEMORY_ROUTING_BLOCK +
-    "**Skills**: verified procedures and explicit user preferences or corrections for this "
-    "class of task. Update when there is durable evidence, not to meet a quota.\n\n"
+    "**Skills**: how to do this class of task. Be ACTIVE — most sessions produce at least one "
+    "skill update. A pass that does nothing is a missed learning opportunity, not a neutral "
+    "outcome.\n\n"
     "Target shape of the skill library: CLASS-LEVEL skills with a SKILL.md of always-on rules and a "
     "small `references/` set of topical depth — not narrow one-session skills, and not an umbrella "
     "hoarding a references/ file per session.\n\n" + _LESSON_LAYER_BLOCK +
@@ -531,8 +526,7 @@ _COMBINED_REVIEW_PROMPT = (
     "is a FIRST-CLASS skill signal, not just a memory signal. 'stop doing X', 'don't format like "
     "this', 'I hate when you Y' — embed the lesson in the skill that governs that task so the next "
     "session starts fixed.\n"
-    "  • Non-trivial technique, fix, workaround, or debugging path emerged and its result was "
-    "independently verified.\n"
+    "  • Non-trivial technique, fix, workaround, or debugging path emerged.\n"
     "  • A skill that was loaded or consulted turned out wrong, missing, or outdated — patch it "
     "now.\n\n"
     "Preference order for skills — pick the earliest that fits:\n"
@@ -566,8 +560,8 @@ _COMBINED_REVIEW_PROMPT = (
     "If you notice overlapping existing skills, mention it — the background curator handles "
     "consolidation. Never delete a skill here.\n\n"
     "Do NOT capture as skills" + _DO_NOT_CAPTURE_BLOCK +
-    "Act on whichever dimension has real signal. If there is no durable memory fact, verified "
-    "procedure, or explicit user preference/correction to save, say 'Nothing to save.' and stop."
+    "Act on whichever of the two dimensions has real signal. If genuinely nothing stands out on "
+    "either, say 'Nothing to save.' and stop — but don't reach for that conclusion as a default."
 )
 
 

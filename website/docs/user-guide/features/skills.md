@@ -603,14 +603,6 @@ procedures that should load only when relevant. The background review can
 suggest or stage skill changes after a session, but the write-approval gate
 below lets you require human review before those changes land.
 
-Background review instructions require evidence of the relevant final result
-before presenting a learned procedure as working: user confirmation, a test or
-tool result checking the expected final state, or an external re-query. A
-confident completion message or a check of an earlier step is insufficient.
-The reviewer may save explicit user preferences and corrections even when the
-task's outcome is unverified; otherwise, saving no procedure is a valid result.
-This is guidance for the review model, rather than an automatic outcome grader.
-
 ### When the Agent Creates Skills
 
 The system prompt asks the agent to record a non-trivial workflow with `skill_manage` for
