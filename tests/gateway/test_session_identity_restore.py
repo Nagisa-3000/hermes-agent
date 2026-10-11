@@ -7,9 +7,10 @@ Real ``GatewayRunner`` resolvers and a real ``SessionStore`` over a temp ``HERME
 patched predicates.
 """
 
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -131,6 +132,49 @@ def test_restored_lane_delivers_through_the_bot_that_received_it_never_the_defau
     legacy_source = fresh3.runner._restored_source(SessionEntry.from_dict(legacy))
     assert identity_of(legacy_source) is None
     assert fresh3.runner._delivery_adapter_for(legacy_source) is fresh3.primary  # the heuristic, as before
+
+
+def test_restored_notifications_use_recorded_transport_and_fail_closed_when_offline(mux):
+    """Synthetic and raw watcher notifications keep the persisted receiving bot after restore."""
+    from gateway.session_identity import resolve_identity
+
+    store = SessionStore(sessions_dir=mux.home / "sessions", config=mux.runner.config)
+    mux.runner.session_store = store
+    routed = mux.team_b.build_source(chat_id="555", chat_type="dm", user_id="555")
+    resolve_identity(routed, runner=mux.runner, transport_profile="team_b")
+    entry = store.get_or_create_session(routed)
+
+    fresh, source, _restored = _restart(mux, entry)
+    fresh.runner.session_store = store
+    accepted = AsyncMock()
+
+    async def _accept(event):
+        event._gateway_accepted = True
+
+    accepted.side_effect = _accept
+    fresh.team_b.handle_message = accepted
+    fresh.primary.handle_message = AsyncMock()
+    fresh.team_b.send = AsyncMock()
+    fresh.primary.send = AsyncMock()
+
+    assert fresh.runner._resolve_injection_adapter("telegram", source) is fresh.team_b
+    event = {"type": "completion", "session_key": entry.session_key, "platform": "telegram", "chat_id": "555"}
+    assert asyncio.run(fresh.runner._inject_watch_notification("completed", event)) is True
+    fresh.team_b.handle_message.assert_awaited_once()
+    fresh.primary.handle_message.assert_not_awaited()
+
+    watcher = dict(event, thread_id=None)
+    asyncio.run(fresh.runner._send_watcher_message("telegram", "555", None, "raw notice", watcher))
+    fresh.team_b.send.assert_awaited_once()
+    fresh.primary.send.assert_not_awaited()
+
+    fresh.runner._profile_adapters["team_b"] = {}
+    assert fresh.runner._resolve_injection_adapter("telegram", source) is None
+    assert asyncio.run(fresh.runner._inject_watch_notification("offline", event)) is False
+    await_count = fresh.team_b.handle_message.await_count
+    asyncio.run(fresh.runner._send_watcher_message("telegram", "555", None, "deferred", watcher))
+    assert fresh.team_b.handle_message.await_count == await_count
+    assert fresh.primary.send.await_count == 0
 
 
 def test_standalone_gateway_persists_nothing_and_keys_stay_agent_main(tmp_path, monkeypatch):

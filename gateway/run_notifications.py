@@ -1248,9 +1248,26 @@ class GatewayNotificationsMixin:
         fallback for minimal runner stubs / exotic platform strings when the resolver can't run."""
         from gateway.delivery import resolve_delivery_transport
         if source is not None:
-            owner = self._transport_owner(source)
-            if owner is not None:
-                return owner[0]
+            from gateway.session_identity import identity_of
+            identity = identity_of(source)
+            transport_owner = self._transport_owner(source)
+            # Synthetic notifications are deliveries, so use the same persisted transport
+            # resolver as every other outbound path.  In particular, a restored source may run
+            # under a different profile from the bot that originally received it; falling back to
+            # the runtime profile here can send the notice through the wrong bot.  A pinned transport
+            # with no live adapter must stay fail-closed rather than borrowing that runtime adapter.
+            if identity is not None or transport_owner is not None:
+                try:
+                    delivery = self._delivery_adapter_for(source)
+                except Exception:
+                    logger.debug("Synthetic delivery resolver failed", exc_info=True)
+                    delivery = None
+                if delivery is not None:
+                    return delivery
+                if identity is not None and identity.multiplexed and not identity.transport_inferred:
+                    return None
+            if transport_owner is not None:
+                return transport_owner[0]
             if getattr(source, "delivered_via_upstream_relay", False) is True:
                 return self.adapters.get(Platform.RELAY)
         # One resolver with authz/kanban/cron: a secondary's own map, or the primary's for a
