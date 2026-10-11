@@ -36,6 +36,32 @@ def read_pending(key: str) -> dict | None:
     return record
 
 
+def requeue(key: str) -> dict | None:
+    """Return a claimed deferred delivery to the queued state after a retryable busy result."""
+    root = _root()
+    with _FileLock(root / ".lock"):
+        record = read_pending(key)
+        if record is None or record.get("status") != "claimed":
+            return record
+        record.update(status="queued", error=None)
+        atomic_json_write(root / f"{key}.json", record, fsync_dir=True, mode=0o600)
+        return record
+
+
+def has_pending_for_home(home: Path | str, *, before_sequence: int | None = None,
+                         exclude_id: str | None = None) -> bool:
+    """Whether an earlier deferred Bot Chat delivery still needs its turn."""
+    target = str(Path(home).resolve())
+    for _, record in _records(_root()):
+        if (str(record.get("home") or "") != target
+                or record.get("status") not in ("queued", "claimed")
+                or record.get("id") == exclude_id):
+            continue
+        if before_sequence is None or int(record.get("sequence", 0)) < before_sequence:
+            return True
+    return False
+
+
 def _records(root: Path) -> list[tuple[Path, dict]]:
     records = []
     for path in root.glob("*.json"):
@@ -136,7 +162,10 @@ def _drain(root: Path) -> None:
             logger.exception("Deferred Bot Chat delivery %s failed", record["id"])
         receipt = job.get("_bot_chat_delivery_receipts", {}).get(
             f"bot-chat:{record['profile'] or '(own)'}")
-        status = "transferred" if receipt else "ambiguous" if error else "settled"
+        if job.get("no_agent"):
+            status = (receipt or {}).get("status") if receipt else "ambiguous" if error else "settled"
+        else:
+            status = "transferred" if receipt else "ambiguous" if error else "settled"
         if job.get("_notification_all_targets_suppressed"):
             status = "suppressed"
         record.update(status=status, error=error)

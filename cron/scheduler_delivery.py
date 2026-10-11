@@ -20,6 +20,7 @@ import sys
 import threading
 from dataclasses import dataclass
 from typing import Any, List, Optional
+from cron.scheduler_bot_chat import deliver_no_agent_bot_chat
 
 
 # Log-record parity with the origin module.
@@ -718,9 +719,7 @@ def _get_standalone_send_timeout() -> int:
         return 60
 
 
-_BOT_CHAT_STDERR_TAIL = 500
-# stdout is the model's answer; only a short tail is persisted (jobs.json / ledger).
-_BOT_CHAT_STDOUT_TAIL = 200
+_BOT_CHAT_STDERR_TAIL, _BOT_CHAT_STDOUT_TAIL = 500, 200
 _BOT_CHAT_BANNER_PREFIXES = ("Resumed session", "session_id:")
 
 
@@ -815,18 +814,16 @@ def _deliver_to_bot_chat(job: dict, content: str, profile: str, *, deferred: Opt
             BOT_CHAT_POLICY_PLATFORM, load_user_config_effective(home / "config.yaml"))
         if deferred is not None and not (home / "state.db").is_file():
             return f"bot-chat delivery target no longer exists: {home}; do not resend"
-        # run_one_job/claim_fire attach the durable execution id before delivery. The
-        # transient fallback supports direct helper callers, never deduping recurring
-        # runs by their (potentially identical) output or previous last_run timestamp.
-        run_id = job.get("execution_id")
-        if not run_id:
-            run_id = job.setdefault("_bot_chat_run_id", uuid.uuid4().hex)
+        # run_one_job/claim_fire attach the durable execution id; direct helper callers use a transient fallback.
+        run_id = job.get("execution_id") or job.setdefault("_bot_chat_run_id", uuid.uuid4().hex)
         key = hashlib.sha256(json.dumps(
             [str(source_home), job_id, str(run_id), str(home)],
             ensure_ascii=False, separators=(",", ":"),
         ).encode("utf-8")).hexdigest()
         if deferred is not None:
             key = deferred["id"]
+        if job.get("no_agent") and not for_failure:
+            return deliver_no_agent_bot_chat(job, content, profile_label, home, key, deferred=deferred)
         # Read BEFORE discovery: the previous owner may have exited after accepting.
         # No receipt state, including ambiguous/failed, authorizes a CLI replay.
         receipt = read_delivery_result(home, key)
