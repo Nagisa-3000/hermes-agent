@@ -377,6 +377,36 @@ def test_a_timed_out_child_never_waits_on_a_grandchild_holding_its_pipes(monkeyp
     assert time.monotonic() - started < 15, "run() waited on a grandchild after the timeout"
 
 
+def test_failed_windows_resume_kills_and_reaps_the_child(monkeypatch):
+    """A failed suspended launch must not leave a terminated child unreaped."""
+    import ctypes
+
+    from hermes_cli import update_lock
+
+    class _Ntdll:
+        NtResumeProcess = staticmethod(lambda _handle: 1)
+
+    class _Proc:
+        _handle = 123
+        pid = 456
+
+        def __init__(self):
+            self.killed = 0
+            self.waited = 0
+
+        def kill(self):
+            self.killed += 1
+
+        def wait(self):
+            self.waited += 1
+
+    monkeypatch.setattr(ctypes, "WinDLL", lambda *_args, **_kwargs: _Ntdll(), raising=False)
+    proc = _Proc()
+    with pytest.raises(OSError, match="could not resume update child 456"):
+        update_lock.resume_suspended_child(proc)
+    assert (proc.killed, proc.waited) == (1, 1)
+
+
 def _held_lock_recorder(tmp_path: Path, name: str, body: str) -> Path:
     """An executable on a fresh PATH dir that records whether it holds the checkout lock fd."""
     bin_dir = tmp_path / "bin"

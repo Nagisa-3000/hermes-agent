@@ -1258,7 +1258,13 @@ def resume_suspended_child(proc: subprocess.Popen) -> None:
     ntdll.NtResumeProcess.argtypes = [ctypes.c_void_p]
     ntdll.NtResumeProcess.restype = ctypes.c_long
     if ntdll.NtResumeProcess(int(proc._handle)) != 0:
-        proc.kill()
+        # ``Popen.kill`` only requests termination.  Reap the process before
+        # returning so a failed suspended launch cannot accumulate a child
+        # handle/process entry on Windows.
+        try:
+            proc.kill()
+        finally:
+            proc.wait()
         raise OSError(f"could not resume update child {proc.pid}")
 
 

@@ -169,7 +169,10 @@ def _run_in_custody(argv: list, root: Path, **kwargs) -> int:
         # health: allow HX006 -- unbounded by design: the update's own supervised child
         return proc.wait()
     except BaseException:
-        proc.kill()
+        try:
+            proc.kill()
+        finally:
+            proc.wait()
         raise
 
 

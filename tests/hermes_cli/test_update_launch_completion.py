@@ -103,6 +103,52 @@ def test_completed_tree_discharges_only_a_marker_older_than_its_stamp(
     assert not pending.exists()
 
 
+def test_dirty_completed_stamp_discharges_an_older_marker(tmp_path, monkeypatch, completion_tail):
+    """A completed source build may name a dirty checkout; an older marker is not new debt."""
+    import pm
+    from hermes_cli.source_stamp import write_source_stamp
+
+    root = _committed_checkout(tmp_path, monkeypatch)
+    original = (root / "pyproject.toml").read_text(encoding="utf-8")
+    (root / "pyproject.toml").write_text(original + "\n# local change\n", encoding="utf-8")
+    stamp = write_source_stamp(root)
+    assert stamp and stamp["dirty"] is True
+    pending = venv_sync.arm_completion(root)
+    stamped = (root / "install-stamp.json").stat().st_mtime
+    os.utime(pending, (stamped - 60, stamped - 60))
+    monkeypatch.setattr(pm, "venv_is_current", lambda **kw: True)
+
+    assert venv_sync.prepare_launch(root, []) is None
+    assert not pending.exists()
+    assert not completion_tail
+
+
+def test_dirty_completed_stamp_does_not_bless_a_clean_tree(tmp_path, monkeypatch, completion_tail):
+    """Cleaning a dirty-built checkout must not discharge its completion marker."""
+    import pm
+    from hermes_cli.source_stamp import write_source_stamp
+
+    root = _committed_checkout(tmp_path, monkeypatch)
+    original = (root / "pyproject.toml").read_text(encoding="utf-8")
+    (root / "pyproject.toml").write_text(original + "\n# local change\n", encoding="utf-8")
+    stamp = write_source_stamp(root)
+    assert stamp and stamp["dirty"] is True
+    (root / "pyproject.toml").write_text(original, encoding="utf-8")
+    pending = venv_sync.arm_completion(root)
+    stamped = (root / "install-stamp.json").stat().st_mtime
+    os.utime(pending, (stamped - 60, stamped - 60))
+    monkeypatch.setattr(pm, "venv_is_current", lambda **kw: True)
+    completion_tail.exit_code = 1
+    from hermes_cli.version_info import _git_version_info
+    assert _git_version_info(root, include_untracked=True).dirty is False
+    assert not venv_sync._tree_matches_completed_stamp(root)
+
+    with pytest.raises(RuntimeError, match="completion failed"):
+        venv_sync.prepare_launch(root, [])
+    assert pending.exists()
+    assert len(completion_tail) == 1
+
+
 @pytest.mark.parametrize("edited", [False, True])
 def test_pristine_home_provisions_dependencies_without_rebuild(tmp_path, monkeypatch, completion_tail, edited):
     """Pristine HERMES_HOME on a freshly installed tree (#123314): with no facts the venv

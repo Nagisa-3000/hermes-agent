@@ -248,6 +248,8 @@ def popen(argv: Sequence[str], *, inherit_lock: bool = False, **kwargs) -> subpr
         except BaseException:
             with contextlib.suppress(OSError):
                 proc.kill()
+            with contextlib.suppress(OSError):
+                proc.wait()
             raise
         return proc
     return subprocess.Popen(list(argv), **_custody_kwargs(inherit_lock, kwargs))
@@ -279,7 +281,10 @@ def run(argv: Sequence[str], *, inherit_lock: bool = False, **kwargs) -> subproc
                 exc.stdout, exc.stderr = drained
             raise
         except BaseException:
-            proc.kill()
+            try:
+                proc.kill()
+            finally:
+                proc.wait()
             raise
         code = proc.poll()
     if check and code:

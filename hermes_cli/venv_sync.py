@@ -310,7 +310,7 @@ def _supervised_child() -> bool:
 
 
 def _tree_matches_completed_stamp(root: Path) -> bool:
-    """True when the checkout is the exact clean tree the last install/update completed.
+    """True when the checkout still has the identity the last install/update completed.
 
     Every finished tail records its tree in install-stamp.json (write_source_stamp);
     when that commit is a clean HEAD, the products in the tree were built for it, so a
@@ -319,20 +319,27 @@ def _tree_matches_completed_stamp(root: Path) -> bool:
     Windows installs and pristine HERMES_HOMEs hit exactly this: #123314). A marker
     armed after the stamp is newer debt (a same-commit ``hermes update`` that failed
     or was killed) and is still owed. Boot-time adoption also stamps HEAD but builds
-    nothing, so its stamp (``adoptedAt``) is not evidence; neither is a dirty tree.
+    nothing, so its stamp (``adoptedAt``) is not evidence. Dirty source checkouts are
+    valid update inputs, so their dirty identity must be compared with the live tree
+    instead of being rejected unconditionally.
     """
     from hermes_cli.steward import read_install_stamp
     from hermes_cli.version_info import _git_version_info
 
     stamp = read_install_stamp(root)
     commit = stamp.get("commit")
-    if not isinstance(commit, str) or not commit or "adoptedAt" in stamp or stamp.get("dirty") is not False:
+    if not isinstance(commit, str) or not commit or "adoptedAt" in stamp:
         return False
     pending = completion_pending_path(root)
     if pending.is_file() and pending.stat().st_mtime >= (root / "install-stamp.json").stat().st_mtime:
         return False
     info = _git_version_info(root, include_untracked=True)
-    return info.commit == commit and not info.dirty
+    # A source completion can legitimately publish a dirty stamp: self-managed
+    # checkouts are allowed to carry local edits while they are updated.  The
+    # marker timestamp still tells us whether a later completion was owed.  Keep
+    # requiring the current tree to have the same dirty/clean shape so cleaning a
+    # locally-built tree cannot silently bless a different checkout.
+    return info.commit == commit and info.dirty == bool(stamp.get("dirty", False))
 
 
 def prepare_launch(project_root: Path, argv: list[str]) -> Path | None:
