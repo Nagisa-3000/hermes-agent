@@ -1,5 +1,6 @@
-"""Bot Chat cron delivery: deliver='bot-chat[:<profile>]' injects job output
-into a local profile's canonical Bot Chat session as a real inbound turn.
+"""Bot Chat cron delivery: deliver='bot-chat[:<profile>]' targets a local profile's
+canonical Bot Chat session. Agent jobs use an inbound turn; no_agent jobs use a
+transcript-only completion row.
 
 Covers token parsing, target resolution (own profile / named / missing),
 preflight exemption, create-time validation, the subprocess delivery lane,
@@ -218,6 +219,105 @@ def test_deliver_message_carries_cron_attribution(tmp_path):
     assert 'Cronjob "Daily digest" output' in captured["message"]
     assert "not the user" in captured["message"]
     assert "the payload" in captured["message"]
+
+
+def _bot_chat_session(home):
+    from hermes_state import SessionDB
+    from hermes_state_ids import new_session_id
+
+    db = SessionDB(db_path=home / "state.db")
+    session_id = new_session_id()
+    db.create_session(session_id, source="cli")
+    db.set_session_title(session_id, "Bot Chat")
+    db.close()
+    return session_id
+
+
+def test_no_agent_bot_chat_persists_transcript_row_without_agent_turn(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    session_id = _bot_chat_session(tmp_path)
+    job = {"id": "j-no-agent", "execution_id": "run-1", "name": "watchdog", "no_agent": True}
+
+    with mock.patch.object(sched_delivery, "_run_bot_chat_turn") as run:
+        assert _deliver_to_bot_chat(job, "watchdog: healthy", "") is None
+        assert _deliver_to_bot_chat(job, "watchdog: healthy", "") is None
+        run.assert_not_called()
+
+    from hermes_state import SessionDB
+    db = SessionDB(db_path=tmp_path / "state.db")
+    rows = db.get_messages(session_id)
+    db.close()
+    assert len(rows) == 1
+    assert rows[0]["content"] == "watchdog: healthy"
+    assert rows[0]["display_kind"] == "process_complete"
+    assert rows[0]["display_metadata"]["display_text"] == "watchdog: healthy"
+    assert rows[0]["display_metadata"]["cron_delivery_id"] == job["_bot_chat_delivery_receipts"]["bot-chat:(own)"]["delivery_id"]
+
+
+def test_no_agent_bot_chat_creates_canonical_session_without_agent_turn(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    job = {"id": "j-new", "execution_id": "run-new", "name": "watchdog", "no_agent": True}
+
+    with mock.patch.object(sched_delivery, "_run_bot_chat_turn") as run:
+        assert _deliver_to_bot_chat(job, "watchdog: first", "") is None
+        run.assert_not_called()
+
+    from hermes_state import SessionDB
+    db = SessionDB(db_path=tmp_path / "state.db")
+    row = db.get_session_by_title("Bot Chat")
+    rows = db.get_messages(row["id"])
+    db.close()
+    assert row is not None
+    assert [message["content"] for message in rows] == ["watchdog: first"]
+
+
+def test_no_agent_bot_chat_waits_for_active_turn_then_drains(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    session_id = _bot_chat_session(tmp_path)
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    assert db.try_acquire_session_turn_lease(session_id, "active-turn")
+    db.close()
+    job = {"id": "j-busy", "execution_id": "run-busy", "name": "watchdog", "no_agent": True}
+
+    assert "queued" in _deliver_to_bot_chat(job, "watchdog: busy", "")
+    assert job["_bot_chat_delivery_receipts"]["bot-chat:(own)"]["status"] == "queued"
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.release_session_turn_lease(session_id, "active-turn")
+    db.close()
+
+    from cron import bot_chat_delivery
+    bot_chat_delivery.drain()
+    db = SessionDB(db_path=tmp_path / "state.db")
+    rows = db.get_messages(session_id)
+    db.close()
+    assert [row["content"] for row in rows] == ["watchdog: busy"]
+    assert bot_chat_delivery.read_pending(job["_bot_chat_delivery_receipts"]["bot-chat:(own)"]["delivery_id"])["status"] == "settled"
+
+
+def test_no_agent_bot_chat_requeues_if_drain_races_a_new_turn(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    session_id = _bot_chat_session(tmp_path)
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    assert db.try_acquire_session_turn_lease(session_id, "active-turn")
+    db.close()
+    job = {"id": "j-race", "execution_id": "run-race", "name": "watchdog", "no_agent": True}
+
+    assert "queued" in _deliver_to_bot_chat(job, "watchdog: race", "")
+    delivery_id = job["_bot_chat_delivery_receipts"]["bot-chat:(own)"]["delivery_id"]
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.release_session_turn_lease(session_id, "active-turn")
+    db.close()
+
+    from cron import bot_chat_delivery, scheduler_bot_chat
+    monkeypatch.setattr(scheduler_bot_chat, "_append", lambda *args: ("busy", None))
+    bot_chat_delivery.drain()
+    assert bot_chat_delivery.read_pending(delivery_id)["status"] == "queued"
 
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(sched_delivery.__file__)))

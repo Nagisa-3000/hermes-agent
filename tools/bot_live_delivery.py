@@ -87,6 +87,19 @@ def has_mailbox(profile_home: Path | str) -> bool:
     return _root(profile_home).is_dir()
 
 
+def has_pending_delivery(profile_home: Path | str) -> bool:
+    """Whether a live-owner delivery is queued or claimed for this profile."""
+    if not has_mailbox(profile_home):
+        return False
+    root = _root(profile_home)
+    with _locked(profile_home):
+        for path in root.glob("*.json"):
+            record = _scan_read(path)
+            if record is not None and record.get("status") in {"queued", "claimed"}:
+                return True
+    return False
+
+
 @contextmanager
 def _locked(home: Path | str):
     root = _root(home)
