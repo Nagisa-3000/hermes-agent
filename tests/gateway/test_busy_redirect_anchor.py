@@ -102,3 +102,40 @@ async def test_a_turn_that_takes_in_an_addressed_message_keeps_the_silence_fallb
         assert outcome.redirected or outcome.steered
 
     assert (opening.reply_expected, ctx.reply_expected) == (True, True)
+
+
+@pytest.mark.asyncio
+async def test_accepted_steer_retains_the_opening_request_for_a_follow_up_turn():
+    """A steer must not make the request that opened the turn disappear."""
+    runner = GatewayRunner(config=GatewayConfig())
+    receiver = Receiver()
+    opening, _, incoming, _ = _running_turn(runner, "key", receiver)
+    opening.reply_expected = incoming.reply_expected = True
+
+    outcome = await runner._resolve_busy_steer_or_redirect(incoming, "key", "steer", receiver)
+
+    assert outcome.steered is True
+    retained = runner._session_state("key").conversation.queued_events
+    assert len(retained) == 1
+    assert retained[0] is not opening
+    assert retained[0].text == opening.text
+    assert retained[0].metadata["_steer_obligation_pending"] is True
+
+    # A second steer in the same run does not enqueue the opening request twice.
+    second = MessageEvent(text="Also check tomorrow's forecast.", source=incoming.source, message_id="C")
+    assert (await runner._resolve_busy_steer_or_redirect(second, "key", "steer", receiver)).steered
+    assert len(runner._session_state("key").conversation.queued_events) == 1
+
+
+@pytest.mark.asyncio
+async def test_explicit_steer_supersession_does_not_retain_the_opening_request():
+    runner = GatewayRunner(config=GatewayConfig())
+    receiver = Receiver()
+    opening, _, incoming, _ = _running_turn(runner, "key", receiver)
+    opening.reply_expected = incoming.reply_expected = True
+    incoming.metadata["supersedes_previous_request"] = True
+
+    outcome = await runner._resolve_busy_steer_or_redirect(incoming, "key", "steer", receiver)
+
+    assert outcome.steered is True
+    assert runner._session_state("key").conversation.queued_events == []

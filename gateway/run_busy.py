@@ -14,6 +14,7 @@ import contextlib
 import json
 import os
 import time
+from copy import copy
 from agent.i18n import DEFAULT_LANGUAGE, t
 from agent.session_activity import format_iteration_progress
 from gateway.config import Platform
@@ -662,7 +663,9 @@ class GatewayBusySessionMixin:
         """
         if not self._try_agent_verb(running_agent, "redirect", text, session_key, event=event):
             return False
-        turn = self._fold_into_running_turn(running_agent, session_key, event)
+        turn = self._fold_into_running_turn(
+            running_agent, session_key, event, preserve_steer_origin=False,
+        )
         if turn is None:
             return True  # a newer turn already owns the slot; never re-anchor it
         anchor = self._reply_anchor_for_event(event)
@@ -675,7 +678,60 @@ class GatewayBusySessionMixin:
             turn.ctx.inbound_message_id = inbound_id
         return True
 
-    def _fold_into_running_turn(self, running_agent, session_key: str, event: MessageEvent):
+    @staticmethod
+    def _steer_explicitly_supersedes_previous(event: MessageEvent) -> bool:
+        """Return whether an accepted steer explicitly cancels the earlier request."""
+        metadata = getattr(event, "metadata", None) or {}
+        return any(
+            metadata.get(key) is True
+            for key in ("supersedes_previous_request", "supersedes_request", "cancel_previous_request")
+        )
+
+    def _preserve_steer_origin(self, running_turn, session_key: str, event: MessageEvent) -> None:
+        """Retain a request that a steer interrupted until it gets its own final turn."""
+        origin = getattr(running_turn, "event", None)
+        if (
+            origin is None
+            or origin is event
+            or getattr(origin, "internal", False)
+            or getattr(origin, "reply_expected", None) is False
+            or self._steer_explicitly_supersedes_previous(event)
+        ):
+            return
+        origin_metadata = getattr(origin, "metadata", None)
+        if not isinstance(origin_metadata, dict):
+            origin_metadata = {}
+            origin.metadata = origin_metadata
+        if origin_metadata.get("_steer_obligation_pending") is True:
+            return
+
+        retained = copy(origin)
+        retained.metadata = dict(origin_metadata)
+        retained.metadata["_steer_obligation_pending"] = True
+        retained.metadata["_steer_obligation_origin_id"] = (
+            str(getattr(origin, "message_id", None)) if getattr(origin, "message_id", None) else None
+        )
+        retained._gateway_accepted = True
+        origin_metadata["_steer_obligation_pending"] = True
+
+        adapter = self._delivery_adapter_for(getattr(origin, "source", None))
+        pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
+        overflow = self._overflow_queue(session_key)
+        if isinstance(pending_slot, dict) and session_key not in pending_slot:
+            pending_slot[session_key] = retained
+        elif overflow is not None:
+            overflow.insert(0, retained)
+        else:
+            self._session_state(session_key).conversation.queued_events.insert(0, retained)
+        logger.info(
+            "Retained opening request for session %s after accepted busy steer; "
+            "it will run as a follow-up unless explicitly superseded",
+            session_key,
+        )
+
+    def _fold_into_running_turn(
+        self, running_agent, session_key: str, event: MessageEvent, *, preserve_steer_origin: bool = True,
+    ):
         """The running turn now answers *event* too (steer, redirect): if *event* was addressed to
         the bot, a bare silence marker must not end the turn. Returns the turn, or None when a newer
         turn already owns the slot."""
@@ -683,6 +739,8 @@ class GatewayBusySessionMixin:
         if turn.agent is not running_agent:
             return None
         if turn.event is not None and turn.event is not event:
+            if preserve_steer_origin:
+                self._preserve_steer_origin(turn, session_key, event)
             turn.event.absorb_reply_expected(event)
             if turn.ctx is not None:
                 turn.ctx.reply_expected = turn.event.reply_expected
