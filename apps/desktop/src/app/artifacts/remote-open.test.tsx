@@ -57,11 +57,13 @@ it('keeps discovered file paths and originating session scope intact through rem
     logs: [],
     windowButtonPosition: null,
     mode: 'remote',
+    authMode: 'oauth',
+    remoteKind: 'url',
     connectionId: 'remote-fixture',
     profile: 'writer',
-    baseUrl: 'http://localhost',
+    baseUrl: 'http://100.64.0.1:9119',
     token: '',
-    wsUrl: ''
+    wsUrl: 'ws://100.64.0.1:9119/api/ws?ticket=fixture'
   })
   render(
     <MemoryRouter>
@@ -103,9 +105,23 @@ it('keeps discovered file paths and originating session scope intact through rem
   })
 })
 
-it('reads a registry-owned session through its owning connection', async () => {
+it('reads a registry-owned OAuth session through its owning connection', async () => {
   listAllProfileSessions.mockResolvedValueOnce({
     sessions: [{ id: 'voyo-session', title: 'Remote', profile: 'default', connection_id: 'voyo' }]
+  })
+  $connection.set({
+    isFullscreen: false,
+    nativeOverlayWidth: 0,
+    logs: [],
+    windowButtonPosition: null,
+    mode: 'remote',
+    authMode: 'oauth',
+    remoteKind: 'url',
+    connectionId: 'voyo',
+    profile: 'default',
+    baseUrl: 'http://100.64.0.1:9119',
+    token: '',
+    wsUrl: 'ws://100.64.0.1:9119/api/ws?ticket=fixture'
   })
   const client = await vi.importActual<typeof HermesClient>('@/hermes')
   const api = vi.fn().mockResolvedValue({ messages: [], session_id: 'voyo-session' })
