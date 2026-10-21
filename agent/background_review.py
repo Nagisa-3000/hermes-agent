@@ -987,7 +987,17 @@ def build_cache_parity_fork(
     # (_routed_reasoning_config).
     if not _routed and write_origin == "background_review":
         _warn_ignored_reasoning_effort(agent, task_cfg)
-    review_agent = AIAgent(**_fork_init_kwargs(agent, _rt, _routed, max_iterations, task_cfg))
+    # Construction mints its own session id and publishes it through _publish_session_id ->
+    # set_current_session_id, which also writes os.environ["HERMES_SESSION_ID"] unless the caller is
+    # a delegated child. This fork is built in the parent process and never persists that id
+    # (_persist_disabled / _session_db = None), so the env write left every later tool subprocess
+    # pointed at a session with no row in state.db, and anything that resolves "the current session"
+    # from the environment recorded an id nothing could look up (#142720). Entering the child
+    # context makes the publish task-local, the way delegate_task children already construct
+    # theirs, and restores the parent's ContextVar when the scope exits.
+    from agent.delegation_context import delegated_child_context  # local: keeps import cost off load
+    with delegated_child_context(str(getattr(agent, "session_id", "") or "")):
+        review_agent = AIAgent(**_fork_init_kwargs(agent, _rt, _routed, max_iterations, task_cfg))
     review_agent._memory_write_origin = review_agent._memory_write_context = write_origin
     # Fork-turn log tag: the fork shares the parent's session_id (and model on the
     # same-model path), so its turn-start/turn-exit log lines are otherwise
