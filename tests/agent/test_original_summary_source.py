@@ -1,10 +1,12 @@
 from types import SimpleNamespace
 
-from agent.agent_init import _parse_compression_config
+import pytest
+
+from agent.agent_init_compression import _parse_compression_config
 from agent.context_compressor import (
     COMPRESSED_SUMMARY_METADATA_KEY, ContextCompressor, SUMMARY_PREFIX, _MERGED_SUMMARY_DELIMITER,
 )
-from hermes_cli.config import DEFAULT_CONFIG
+from hermes_cli.config import DEFAULT_CONFIG, load_config
 
 
 def _agent():
@@ -19,16 +21,27 @@ def _summary(label):
     }
 
 
-def test_original_source_config_is_opt_in_and_bounded():
+def _archived_rows(messages):
+    return [
+        {**message, "_row_id": index, "_summary_source_active": False}
+        for index, message in enumerate(messages, start=1)
+    ]
+
+
+def test_original_source_config_is_opt_in_and_bounded(tmp_path, monkeypatch):
     default = _parse_compression_config(_agent(), {})
     assert default.summary_source == DEFAULT_CONFIG["compression"]["summary_source"] == "previous"
     assert default.summary_source_windows == 2
 
-    parsed = _parse_compression_config(
-        _agent(), {"compression": {"summary_source": "original", "summary_source_windows": 99}}
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "compression:\n  summary_source: original\n  summary_source_windows: 99\n  prepare_ahead: true\n",
+        encoding="utf-8",
     )
+    parsed = _parse_compression_config(_agent(), load_config())
     assert parsed.summary_source == "original"
     assert parsed.summary_source_windows == 8
+    assert parsed.prepare_ahead is True
 
 
 def test_original_prompt_does_not_use_previous_summary():
@@ -49,9 +62,10 @@ def test_original_source_reads_recent_raw_windows_and_freezes_older_checkpoint()
         def get_messages_as_conversation(self, session_id, **kwargs):
             assert session_id == "session-1"
             assert kwargs["include_ancestors"] is True
-            assert kwargs["include_inactive"] is True
+            assert kwargs["include_compacted"] is True
+            assert "include_inactive" not in kwargs
             assert kwargs["include_summary_markers"] is True
-            return [
+            return _archived_rows([
                 {"role": "user", "content": "raw-window-0"},
                 _summary("checkpoint-1"),
                 {"role": "assistant", "content": "raw-window-1"},
@@ -59,7 +73,7 @@ def test_original_source_reads_recent_raw_windows_and_freezes_older_checkpoint()
                 {"role": "user", "content": "raw-window-2"},
                 _summary("checkpoint-3"),
                 {"role": "assistant", "content": "live-tail"},
-            ]
+            ])
 
     compressor = ContextCompressor(
         model="test", quiet_mode=True, summary_source="original", summary_source_windows=2,
@@ -83,18 +97,40 @@ def test_original_source_keeps_live_content_from_merged_summary_carriers():
 
     class FakeSessionDB:
         def get_messages_as_conversation(self, session_id, **kwargs):
-            return [
+            return _archived_rows([
                 {"role": "user", "content": "raw-window-1"},
                 merged,
                 {"role": "assistant", "content": "live"},
-            ]
+            ])
 
     compressor = ContextCompressor(
         model="test", quiet_mode=True, summary_source="original", summary_source_windows=2,
     )
     compressor.bind_session_state(FakeSessionDB(), "session-1")
     turns, frozen = compressor._load_original_summary_source(
-        [{"role": "user", "content": "current-window"}]
+        [{"role": "user", "content": "carried-tail"}, {"role": "user", "content": "current-window"}]
     )
     assert [turn["content"] for turn in turns] == ["raw-window-1", "carried-tail", "current-window"]
     assert frozen == ""
+
+
+@pytest.mark.parametrize("accepts_keywords", [False, True])
+def test_legacy_session_getter_falls_back_without_reading_audit_history(accepts_keywords):
+    reads = []
+
+    class LegacySessionDB:
+        def get_messages_as_conversation(self, session_id, include_ancestors=False, include_inactive=False):
+            reads.append(include_inactive)
+            return [{"role": "user", "content": "withdrawn audit-only instruction"}]
+
+    class PermissiveLegacySessionDB:
+        def get_messages_as_conversation(self, session_id, **kwargs):
+            reads.append(kwargs.get("include_inactive", False))
+            return [{"role": "user", "content": "withdrawn audit-only instruction"}]
+
+    compressor = ContextCompressor(model="test", quiet_mode=True, summary_source="original")
+    session_db = PermissiveLegacySessionDB() if accepts_keywords else LegacySessionDB()
+    compressor.bind_session_state(session_db, "session-1")
+
+    assert compressor._load_original_summary_source([{"role": "user", "content": "current-window"}]) is None
+    assert reads == ([False] if accepts_keywords else [])
