@@ -11,7 +11,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Mapping, Optional, Protocol, Sequence, Tuple
+from typing import Any, Mapping, Optional, Protocol, Sequence
 
 
 EXPLORATION_TREE_SCHEMA_VERSION = 1
@@ -46,7 +46,7 @@ class ExplorationCost:
         _require_non_negative("tool_calls", self.tool_calls)
         _require_non_negative("elapsed_ms", self.elapsed_ms)
 
-    def to_dict(self) -> Dict[str, int]:
+    def to_dict(self) -> dict[str, int]:
         return {
             "token_count": self.token_count,
             "tool_calls": self.tool_calls,
@@ -54,7 +54,7 @@ class ExplorationCost:
         }
 
     @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> "ExplorationCost":
+    def from_dict(cls, value: Mapping[str, Any]) -> ExplorationCost:
         return cls(
             token_count=value.get("token_count", 0),
             tool_calls=value.get("tool_calls", 0),
@@ -67,7 +67,7 @@ class ExplorationBranch:
     """One action whose downstream result was actually observed in a tree."""
 
     action: str
-    child_ids: Tuple[str, ...] = ()
+    child_ids: tuple[str, ...] = ()
     score: Optional[float] = None
     terminal: bool = False
     cost: ExplorationCost = field(default_factory=ExplorationCost)
@@ -79,7 +79,7 @@ class ExplorationBranch:
         if self.score is not None and not isinstance(self.score, (int, float)):
             raise ValueError("score must be numeric or None")
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "action": self.action,
             "child_ids": list(self.child_ids),
@@ -89,7 +89,7 @@ class ExplorationBranch:
         }
 
     @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> "ExplorationBranch":
+    def from_dict(cls, value: Mapping[str, Any]) -> ExplorationBranch:
         return cls(
             action=value["action"],
             child_ids=tuple(value.get("child_ids", ())),
@@ -106,7 +106,7 @@ class ExplorationState:
     decision_id: str
     parent_id: Optional[str]
     state_digest: str
-    available_actions: Tuple[str, ...]
+    available_actions: tuple[str, ...]
     budget_remaining: Optional[int] = None
     depth: int = 0
 
@@ -151,9 +151,9 @@ class ExplorationEvent:
     parent_id: Optional[str]
     policy_version: str
     state_digest: str
-    available_actions: Tuple[str, ...]
+    available_actions: tuple[str, ...]
     chosen_action: str
-    branches: Tuple[ExplorationBranch, ...]
+    branches: tuple[ExplorationBranch, ...]
     depth: int = 0
 
     def __post_init__(self) -> None:
@@ -185,7 +185,7 @@ class ExplorationEvent:
             depth=self.depth,
         )
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "decision_id": self.decision_id,
             "parent_id": self.parent_id,
@@ -198,7 +198,7 @@ class ExplorationEvent:
         }
 
     @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> "ExplorationEvent":
+    def from_dict(cls, value: Mapping[str, Any]) -> ExplorationEvent:
         return cls(
             decision_id=value["decision_id"],
             parent_id=value.get("parent_id"),
@@ -217,7 +217,7 @@ class ExplorationTree:
 
     tree_id: str
     policy_version: str
-    events: Tuple[ExplorationEvent, ...]
+    events: tuple[ExplorationEvent, ...]
     completed: bool
     schema_version: int = EXPLORATION_TREE_SCHEMA_VERSION
 
@@ -230,7 +230,7 @@ class ExplorationTree:
         if len(decision_ids) != len(set(decision_ids)):
             raise ValueError("exploration event IDs must be unique")
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": self.schema_version,
             "tree_id": self.tree_id,
@@ -240,7 +240,7 @@ class ExplorationTree:
         }
 
     @classmethod
-    def from_dict(cls, value: Mapping[str, Any]) -> "ExplorationTree":
+    def from_dict(cls, value: Mapping[str, Any]) -> ExplorationTree:
         return cls(
             tree_id=value["tree_id"],
             policy_version=value["policy_version"],
@@ -266,7 +266,7 @@ class ReplayReport:
     def coverage(self) -> float:
         return self.supported_decisions / self.total_decisions if self.total_decisions else 0.0
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "policy_version": self.policy_version,
             "tree_id": self.tree_id,
@@ -300,7 +300,7 @@ class PolicyArtifact:
         if self.replay_metrics is not None and not isinstance(self.replay_metrics, Mapping):
             raise ValueError("replay_metrics must be a mapping")
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "schema_version": EXPLORATION_TREE_SCHEMA_VERSION,
             "policy_version": self.policy_version,
@@ -434,5 +434,3 @@ def build_exploration_tree(
         events=tuple(events),
         completed=completed,
     )
-
-

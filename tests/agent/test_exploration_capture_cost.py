@@ -1,7 +1,7 @@
 """Capture preserves persisted identities without repeated history serialization."""
 import hashlib
 import json
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -12,7 +12,7 @@ from agent import exploration_policy, trajectory as trajectory_io
 def test_capture_preserves_prefix_identities_with_linear_serialization(monkeypatch, turns):
     messages = [
         {"from": "gpt", "value": "你好", "metadata": {"z": 1, "a": [None, True]}},
-        {"from": "human", "value": datetime(2026, 1, 1, tzinfo=timezone.utc)},
+        {"from": "human", "value": datetime(2026, 1, 1, tzinfo=UTC)},
     ]
     messages.extend(
         {"from": "gpt" if index % 2 else "tool", "value": "résultat " * 20}

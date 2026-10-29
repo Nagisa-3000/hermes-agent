@@ -5,7 +5,7 @@ import logging
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 from agent.exploration_policy import ExplorationTree, build_exploration_tree
 
@@ -37,7 +37,7 @@ def _lock_append_handle(f, acquire: bool) -> None:
         fcntl.flock(f.fileno(), fcntl.LOCK_EX if acquire else fcntl.LOCK_UN)
 
 
-def _append_jsonl(entry: Dict[str, Any], filename: str) -> None:
+def _append_jsonl(entry: dict[str, Any], filename: str) -> None:
     """Append one serialized entry while holding the same cross-process lock as trajectories."""
     line = json.dumps(entry, ensure_ascii=False) + "\n"
     with open(filename, "a", encoding="utf-8") as f:
@@ -95,4 +95,3 @@ def save_trajectory(
         save_exploration_tree(tree, exploration_filename or _exploration_filename(filename, completed))
     except Exception as exc:
         logger.warning("Failed to capture exploration tree: %s", exc, exc_info=True)
-
