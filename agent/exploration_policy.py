@@ -213,7 +213,7 @@ class ExplorationEvent:
 
 @dataclass(frozen=True)
 class ExplorationTree:
-    """Versioned, serializable history suitable for offline policy replay."""
+    """Replayable history; ``completed`` records turn status, not task acceptance."""
 
     tree_id: str
     policy_version: str
@@ -397,8 +397,9 @@ def build_exploration_tree(
 
     The derived tree records only continue/stop decisions.  It hashes prior trajectory state,
     never copies prompts, tool arguments, or tool output, and marks unobserved alternatives as
-    out of support during replay.  Richer branch instrumentation can add sibling branches later
-    without changing the replay contract.
+    out of support during replay.  Turn completion does not verify task acceptance, so captured
+    branches stay unscored.  Richer branch instrumentation can add verified outcomes and sibling
+    branches later without changing the replay contract.
     """
     decisions = list(_recorded_decisions(trajectory))
     events = []
@@ -408,7 +409,6 @@ def build_exploration_tree(
         chosen_action = "continue" if has_tool_calls else "stop"
         terminal = ordinal == len(decisions) - 1
         child_ids = (f"decision-{ordinal + 1}",) if not terminal else ()
-        score = (1.0 if completed else 0.0) if terminal else None
         events.append(
             ExplorationEvent(
                 decision_id=f"decision-{ordinal}",
@@ -421,7 +421,6 @@ def build_exploration_tree(
                     ExplorationBranch(
                         action=chosen_action,
                         child_ids=child_ids,
-                        score=score,
                         terminal=terminal,
                         cost=ExplorationCost(tool_calls=_tool_call_count(value)),
                     ),
