@@ -28,9 +28,11 @@ _BACKGROUND_REVIEW_CANCEL_TIMEOUT_SECONDS = 2.0
 class _BackgroundReviewRun:
     """Per-review cancellation and request-completion handshake."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, retry_memory: bool = False) -> None:
         self.cancel_requested = threading.Event()
         self.request_done = threading.Event()
+        self._retry_memory = retry_memory
+        self.memory_retry_requested = False
         self._lock = threading.Lock()
         self._review_agent = None
         self._request_finished = self._cancel_dispatched = False
@@ -46,6 +48,7 @@ class _BackgroundReviewRun:
     def cancel(self) -> Any:
         """Fence startup and return the running fork, if one was admitted."""
         with self._lock:
+            self.memory_retry_requested |= self._retry_memory and not self._request_finished
             self.cancel_requested.set()
             if self._review_agent is None or self._cancel_dispatched:
                 return None
@@ -72,9 +75,9 @@ def _optional_lock(agent: Any, attr: str) -> Iterator[None]:
         yield
 
 
-def prepare_background_review_run(agent: Any) -> Optional[_BackgroundReviewRun]:
+def prepare_background_review_run(agent: Any, *, retry_memory: bool = False) -> Optional[_BackgroundReviewRun]:
     """Install a unique run token on the parent before ``Thread.start()``."""
-    run = _BackgroundReviewRun()
+    run = _BackgroundReviewRun(retry_memory=retry_memory)
     try:
         lock = getattr(agent, "_background_review_lock", None)
         if lock is None:
@@ -84,19 +87,38 @@ def prepare_background_review_run(agent: Any) -> Optional[_BackgroundReviewRun]:
             if current is not None and not current.request_done.is_set():
                 return None
             agent._background_review_run = run
+            if retry_memory:
+                agent._memory_review_retry_pending = False
     except (AttributeError, TypeError):
         return None
     return run
 
 
-def finish_background_review_run(agent: Any, run: Optional[_BackgroundReviewRun]) -> None:
-    """Publish one run's request exit without clearing a successor (ABA-safe)."""
+def finish_background_review_run(
+    agent: Any, run: Optional[_BackgroundReviewRun], *, retry_memory: bool = False,
+) -> None:
+    """Publish one run's request exit without clearing a successor (ABA-safe).
+
+    ``retry_memory`` restores an automatic trigger if the worker could not start.
+    """
     if run is None or not run.mark_request_finished():
         return
     with _optional_lock(agent, "_background_review_lock"):
+        if retry_memory and run._retry_memory:
+            agent._memory_review_retry_pending = True
         if getattr(agent, "_background_review_run", None) is run:
             agent._background_review_run = None
     run.request_done.set()
+
+
+def reset_memory_review_retry(agent: Any) -> None:
+    """A session boundary discards both queued debt and the old run's retry eligibility."""
+    with _optional_lock(agent, "_background_review_lock"):
+        agent._memory_review_retry_pending = False
+        run = getattr(agent, "_background_review_run", None)
+        if run is not None:
+            with run._lock:
+                run._retry_memory = run.memory_retry_requested = False
 
 
 def _interrupt_background_review(
@@ -151,7 +173,11 @@ def cancel_background_review_for_live_turn(
     with _optional_lock(agent, "_background_review_lock"):
         run = getattr(agent, "_background_review_run", None)
         legacy_agent = getattr(agent, "_background_review_agent", None)
-    review_agent = legacy_agent if run is None else run.cancel()
+        review_agent = legacy_agent if run is None else run.cancel()
+        if run is not None and run.memory_retry_requested:
+            # Record the debt before the live turn advances its nudge counter. The worker
+            # may acknowledge after that turn ends; only a successor's admission consumes it.
+            agent._memory_review_retry_pending = True
     # Attribute the review fork's usage to the PARENT session. Snapshot BEFORE unregister/close so counters
     # survive teardown. Placed in this finally so a fork that consumed tokens and THEN raised is still
     # attributed (issue #87250). Best-effort: the recorder never raises into the review thread.

@@ -765,7 +765,8 @@ def _tick_memory_nudge(agent: Any) -> bool:
             and "memory" in agent.valid_tool_names
             and agent._memory_store):
         agent._turns_since_memory += 1
-        if agent._turns_since_memory >= agent._memory_nudge_interval:
+        if (agent._turns_since_memory >= agent._memory_nudge_interval
+                or getattr(agent, "_memory_review_retry_pending", False)):
             agent._turns_since_memory = 0
             return True
     return False

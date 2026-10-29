@@ -402,6 +402,8 @@ class AIAgent(
 
         # Turn counter (added after reset_session_state was first written — #2635)
         self._user_turn_count = 0
+        from agent.background_review import reset_memory_review_retry
+        reset_memory_review_retry(self)
         # The drifted-prompt compaction INFO is once per session, so a /new or /resume re-arms it.
         self._compaction_prompt_drift_logged = False
         # Who wrote the current turn. build_turn_context() sets it at the start of every turn.
@@ -799,7 +801,9 @@ class AIAgent(
         )
         from tools.thread_context import propagate_context_to_thread
 
-        review_run = prepare_background_review_run(self)
+        review_run = prepare_background_review_run(
+            self, retry_memory=(review_memory and focus is None and not explicit
+                                and not _review_should_defer(self, task_cfg)))
         if review_run is None:
             return
         try:
@@ -819,7 +823,7 @@ class AIAgent(
             # right profile.
             threading.Thread(target=propagate_context_to_thread(_target_with_requeue), daemon=True, name="bg-review").start()
         except Exception:
-            finish_background_review_run(self, review_run)
+            finish_background_review_run(self, review_run, retry_memory=True)
             raise
 
     _REVIEW_REQUEUE_MAX_ATTEMPTS = 3
