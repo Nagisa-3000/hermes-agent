@@ -35,6 +35,7 @@ from agent.context_compressor_prellm import PreLlmSkipMixin
 from agent.context_compressor_window import CompactionWindowMixin
 from agent.context_compressor_prune import ProactivePruneMixin
 from agent.context_compressor_summary import SummaryDispatchMixin
+from agent.context_compressor_evidence import SummaryEvidenceMixin, fallback_injected_context
 from agent.context_compressor_retry import retryable_user_text
 from agent.context_compressor_tail import (
     demote_stale_tail_tools, lean_tail_budget, is_demoted_stub, skill_view_names_by_call_id, tail_cut_pricer,
@@ -2147,7 +2148,7 @@ Describe agent/tool work only as completed actions, state, or historical work.]"
 
 
 class ContextCompressor(
-    SummaryDispatchMixin, PreLlmSkipMixin, CompressionTelemetryMixin, MicroCompactionMixin,
+    SummaryDispatchMixin, SummaryEvidenceMixin, PreLlmSkipMixin, CompressionTelemetryMixin, MicroCompactionMixin,
     ProactivePruneMixin, CompactionWindowMixin, ContextEngine,
 ):
     """Default context engine: prune tool results, protect head/tail, summarize the middle
@@ -3421,31 +3422,6 @@ class ContextCompressor(
             args = args[:self._TOOL_ARGS_HEAD] + "..."
         return f"  {fn.get('name', '?')}({args})"
 
-    def _serialize_records_for_summary(self, turns: list[dict[str, Any]]) -> list[str]:
-        """Serialize turns into a list of labeled, redacted records for the summarizer."""
-        # Lazy import: agent_runtime_helpers pulls heavy transitive imports.
-        from agent.agent_runtime_helpers import strip_think_blocks
-        parts = []
-        for msg in turns:
-            role = msg.get("role", "unknown")
-            content = msg.get("content")
-            if isinstance(content, list):
-                content = "\n".join(_summary_part_text(part) for part in content if isinstance(part, (dict, str)))
-            content = _redact_compaction_text(content or "")
-            content = _MEDIA_DIRECTIVE_RE.sub("[media attachment]", content)
-            # Strip inline <think>-style blocks: scratch work wastes summarizer context and risks being kept as fact.
-            if role == "assistant" and content:
-                content = strip_think_blocks(None, content)
-            if len(content) > self._CONTENT_MAX:
-                content = elide_middle(content, self._CONTENT_HEAD, self._CONTENT_TAIL)
-            if role == "tool":
-                parts.append(f"[TOOL RESULT {msg.get('tool_call_id', '')}]: {content}")
-                continue
-            if role == "assistant" and msg.get("tool_calls", []):
-                content += "\n[Tool calls:\n" + "\n".join(map(self._render_tool_call_for_summary, msg["tool_calls"])) + "\n]"
-            parts.append(f"[{role.upper()}]: {content}")
-        return parts
-
     def _serialize_for_summary(self, turns: list[dict[str, Any]]) -> str:
         """Serialize turns into labeled, redacted text for the summarizer."""
         return "\n\n".join(self._serialize_records_for_summary(turns))
@@ -3575,6 +3551,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         del _pruned_names[_MAX_PRUNED_SKILL_MARKERS:]
         summary = self._with_summary_prefix(_redact_compaction_text(body.strip()))
         summary = elide(summary, _FALLBACK_SUMMARY_MAX_CHARS)
+        summary += fallback_injected_context(turns_to_summarize, _FALLBACK_SUMMARY_MAX_CHARS - len(summary))
         # Re-inject AFTER the size cap: markers live at the end, where truncation cuts.
         summary = _reinject_pruned_skill_markers(summary, _pruned_names)
         return self._augment_summary_lean(summary, turns_to_summarize)

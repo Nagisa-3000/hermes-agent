@@ -649,6 +649,15 @@ Summary budget scales with the amount of content being compressed:
 - Minimum: 2,000 tokens
 - Maximum: `min(context_length × 0.05, 12,000)` tokens
 
+`agent/context_compressor_evidence.py` supplies prior injected context to both summary paths.
+For an unchanged string user row, an `api_content` sidecar whose prefix exactly matches the
+display text plus the injection separator contributes a separately labelled, untrusted reference
+block. The LLM input shares the existing per-message character limit; the deterministic fallback
+appends a separate section capped at 6,000 characters, using only space left within the original
+8,000-character budget after preserving its continuity anchors. Both redact before truncating and leave
+the original transcript and user-task anchors unchanged. This makes previously supplied recall
+available to the summarizer; the resulting LLM summary can still omit details.
+
 ### Phase 4: Assemble Compressed Messages
 
 The compressed message list is:
