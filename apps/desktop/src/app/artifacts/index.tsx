@@ -1,3 +1,4 @@
+import { LOCAL_CONNECTION_ID } from '@hermes/shared'
 import type * as React from 'react'
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate } from 'react-router'
@@ -287,8 +288,16 @@ export function ArtifactsView({ setStatusbarItemGroup: _setStatusbarItemGroup, .
         // URL. Fetch the bytes over the authenticated fs bridge instead.
         // Tilde/relative hrefs have no file URL form. Keep them gateway-owned:
         // expanding them on the client would target the wrong home or cwd.
-        if (isRemoteGateway() && isArtifactFilePath(artifact.value)) {
-          await downloadGatewayMediaFile(artifact.value, { sessionId: artifact.sessionId, profile: artifact.profile })
+        const remote = artifact.owner?.connectionId
+          ? artifact.owner.connectionId !== LOCAL_CONNECTION_ID
+          : isRemoteGateway()
+
+        if (remote && isArtifactFilePath(artifact.value)) {
+          await downloadGatewayMediaFile(artifact.value, {
+            sessionId: artifact.sessionId,
+            profile: artifact.profile,
+            owner: artifact.owner
+          })
 
           return
         }
@@ -485,7 +494,7 @@ function ArtifactImageCard({ artifact, failedImage, onImageError, onOpenChat }: 
     let active = true
 
     setSrc('')
-    void artifactImageSrc(artifact.value)
+    void artifactImageSrc(artifact.value, artifact.owner)
       .then(nextSrc => {
         if (active) {
           setSrc(nextSrc)
@@ -500,7 +509,7 @@ function ArtifactImageCard({ artifact, failedImage, onImageError, onOpenChat }: 
     return () => {
       active = false
     }
-  }, [artifact.href, artifact.id, artifact.value, onImageError])
+  }, [artifact.href, artifact.id, artifact.value, artifact.owner, onImageError])
 
   return (
     <article
